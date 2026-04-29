@@ -1,0 +1,14 @@
+{
+  "name": "Craft Memory",
+  "slug": "memory",
+  "enabled": true,
+  "provider": "craft-memory",
+  "type": "mcp",
+  "icon": "🧠",
+  "tagline": "Persistent cross-session memory with SQLite + FTS5",
+  "mcp": {
+    "transport": "http",
+    "url": "http://localhost:8392/mcp",
+    "authType": "none"
+  }
+}

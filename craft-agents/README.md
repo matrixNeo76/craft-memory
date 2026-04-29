@@ -6,7 +6,22 @@ This directory contains ready-to-use automation templates for integrating Craft 
 
 | File | Description |
 |------|-------------|
+| `source/config.json` | MCP source configuration — tells Craft Agents how to connect to the memory server |
+| `source/guide.md` | Usage guide loaded by the agent before using memory tools |
 | `automations.json` | 4 automation templates (SessionStart, SessionEnd, SchedulerTick, LabelAdd) |
+
+## MCP Source Setup
+
+Copy `source/config.json` and `source/guide.md` to your workspace sources directory:
+
+```
+~/.craft-agent/workspaces/{your-workspace}/sources/memory/config.json
+~/.craft-agent/workspaces/{your-workspace}/sources/memory/guide.md
+```
+
+The `config.json` registers the source as an HTTP MCP connection to `http://localhost:8392/mcp`. The server must be running before the agent can use it — start it with `craft-memory start` or `start-http.bat` (Windows) / `start-memory.sh` (Unix).
+
+Then add `"memory"` to the `enabledSourceSlugs` array in your workspace config.
 
 ## Automations
 
