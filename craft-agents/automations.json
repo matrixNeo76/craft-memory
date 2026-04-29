@@ -1,0 +1,61 @@
+{
+  "version": 2,
+  "_comment": "Craft Memory automation templates for Craft Agents. Merge these into your workspace automations.json.",
+  "automations": {
+    "SessionStart": [
+      {
+        "name": "Memory: Recover Session Context",
+        "permissionMode": "allow-all",
+        "actions": [
+          {
+            "type": "prompt",
+            "prompt": "SESSION START PROTOCOL:\n\nStep 1 - Ensure memory server is running:\nRun: craft-memory ensure\nWait for OK confirmation before proceeding.\n\nStep 2 - Recover context from previous sessions:\n1. Call get_recent_memory(scope='workspace', limit=10)\n2. Call list_open_loops()\n3. Briefly summarize what you found for the user\n4. If there are open loops, mention them and ask if the user wants to address any\n\nStep 3 - Adopt proactive memory behavior for this session (PERMANENT RULE):\nYOU are the trigger for memory saves — do not wait for the user to ask.\nDuring this session, whenever you complete a significant piece of work, call set_session_labels with the appropriate label BEFORE reporting completion to the user:\n- After completing a phase, fixing a critical bug, or making an architectural decision → set_session_labels(['important'])\n- After discovering a stable fact (API key, URL, tech stack detail, confirmed config) → set_session_labels(['fact-candidate'])\nThis triggers the LabelAdd automation which saves the memory automatically.\nDo NOT accumulate saves for the end — trigger immediately when the work is done.\n\nDo NOT skip any of these steps. This ensures continuity across sessions, even when switching model or provider."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "name": "Memory: Save Session Handoff",
+        "permissionMode": "allow-all",
+        "actions": [
+          {
+            "type": "prompt",
+            "prompt": "SESSION END PROTOCOL: Create a handoff document for the next session using the memory source.\n\nIf tool calls fail with connection errors, run: craft-memory ensure then retry.\n\n1. Call remember() for any key decisions made in this session (category='decision', importance=8)\n2. Call remember() for any important discoveries (category='discovery', importance=7)\n3. Call upsert_fact() for any confirmed, stable knowledge gained\n4. Call close_open_loop() for any loops that were resolved\n5. Call summarize_scope(scope='workspace') to generate a final snapshot\n\nPresent a compact handoff summary to the user showing: decisions, facts, open loops, next steps.\nThis ensures the next session (even with a different model/provider) can recover full context."
+          }
+        ]
+      }
+    ],
+    "SchedulerTick": [
+      {
+        "name": "Memory: Daily Maintenance",
+        "cron": "0 3 * * *",
+        "timezone": "Europe/Rome",
+        "permissionMode": "allow-all",
+        "labels": [
+          "scheduled",
+          "memory-maintenance"
+        ],
+        "actions": [
+          {
+            "type": "prompt",
+            "prompt": "DAILY MEMORY MAINTENANCE:\n\nStep 1 - Ensure server is running:\nRun: craft-memory ensure\nIf server cannot start, report: \"WARNING: Memory server unreachable. Daily maintenance could not run.\"\n\nStep 2 - Perform maintenance:\n1. Call summarize_scope(scope='workspace') to review current state\n2. Review recent memories for consolidation opportunities\n3. Check for facts that should be promoted from memories\n4. Call list_open_loops() and flag any stale loops (older than 30 days)\n5. If you find duplicate or redundant memories, note them for review\n6. Present a brief maintenance report\n\nBe conservative: prefer consolidation over deletion. Only recommend changes, don't delete without user confirmation."
+          }
+        ]
+      }
+    ],
+    "LabelAdd": [
+      {
+        "name": "Memory: Promote Important/Fact-Candidate Labels",
+        "matcher": "^(important|fact-candidate)$",
+        "permissionMode": "allow-all",
+        "actions": [
+          {
+            "type": "prompt",
+            "prompt": "A memory-related label was added to this session.\n\nCheck the current session labels to determine which label was added, then act accordingly:\n- If 'important': Review the session so far and call remember() with importance=9 for the key takeaways.\n- If 'fact-candidate': Review the session and call upsert_fact() for any confirmed, stable knowledge that should persist.\n\nOnly store information that has real lasting value. Confirm to the user what was saved."
+          }
+        ]
+      }
+    ]
+  }
+}
