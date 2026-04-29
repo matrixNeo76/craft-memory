@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "craft-memory-mcp"
+version = "0.1.0"
+description = "Persistent cross-session memory MCP server for Craft Agents"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "Craft Memory Contributors" },
+]
+keywords = ["mcp", "craft-agents", "memory", "sqlite", "fts5"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "fastmcp>=1.26.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+craft-memory = "craft_memory_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/craft_memory_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+
+[tool.coverage.run]
+source = ["craft_memory_mcp"]

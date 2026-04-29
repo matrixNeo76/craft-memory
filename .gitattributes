@@ -1,0 +1,13 @@
+# Force LF line endings in the repo for cross-platform consistency
+* text=auto eol=lf
+
+# Windows batch scripts need CRLF
+*.bat text eol=crlf
+
+# Shell scripts must always be LF
+*.sh text eol=lf
+
+# Binary files
+*.db binary
+*.sqlite binary
+*.whl binary
