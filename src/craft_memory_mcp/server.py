@@ -18,9 +18,27 @@ Environment variables:
   CRAFT_WORKSPACE_ID      - Workspace identifier (default: "default")
 """
 
+import json
 import os
+import re as _re
 import sys
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from pathlib import Path
 from typing import Any
+
+try:
+    _VERSION = _pkg_version("craft-memory-mcp")
+except PackageNotFoundError:
+    _VERSION = "dev"
+
+_PRIVATE_PATTERNS = _re.compile(
+    r"<(private|system-reminder|system-instruction|system)>.*?</\1>",
+    _re.DOTALL | _re.IGNORECASE,
+)
+
+
+def _strip_private(text: str) -> str:
+    return _PRIVATE_PATTERNS.sub("", text).strip()
 
 # ─── Robustness patch: make Pydantic ignore extra framework params ──
 # Agent frameworks like Craft Agent / pi inject internal metadata
@@ -57,6 +75,7 @@ from craft_memory_mcp.db import (
     search_facts as _db_search_facts,
     search_memory as _db_search_memory,
     summarize_scope as _db_summarize_scope,
+    update_memory as _db_update_memory,
     upsert_fact as _db_upsert_fact,
 )
 
@@ -103,8 +122,6 @@ IMPORTANT: Only store what has real value. Avoid noise and trivial entries.""",
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Health check endpoint for monitoring and keep-alive probes."""
-    import os as _os
-    from pathlib import Path as _Path
     from starlette.responses import JSONResponse
     try:
         conn = _get_conn()
@@ -113,14 +130,14 @@ async def health_check(request):
     except Exception as e:
         db_status = f"error: {e}"
 
-    db_dir = _Path(_os.environ.get("CRAFT_MEMORY_DB_DIR", str(_Path.home() / ".craft-agent/memory")))
+    db_dir = Path(os.environ.get("CRAFT_MEMORY_DB_DIR", str(Path.home() / ".craft-agent/memory")))
     db_path = db_dir / f"{WORKSPACE_ID}.db"
     db_size_mb = round(db_path.stat().st_size / 1024 / 1024, 2) if db_path.exists() else 0
 
     return JSONResponse({
         "status": "healthy" if db_status == "healthy" else "degraded",
         "service": "craft-memory",
-        "version": "0.1.0",
+        "version": _VERSION,
         "workspace": WORKSPACE_ID,
         "transport": MCP_TRANSPORT,
         "db": db_status,
@@ -185,6 +202,9 @@ def remember(
     """
     conn = _get_conn()
     session_id = source_session or CRAFT_SESSION_ID
+    content = _strip_private(content)
+    if not content:
+        return "Memory skipped: content was empty after stripping private tags."
     mem_id = _db_remember(
         conn, session_id, WORKSPACE_ID, content,
         category, importance, scope, session_id, tags,
@@ -235,18 +255,20 @@ def search_memory(
 def get_recent_memory(
     scope: str | None = None,
     limit: int = 10,
+    max_tokens: int | None = None,
 ) -> str:
-    """Get most recent memories, ordered by creation time. Use at session start.
+    """Get most recent memories, ranked by importance with time decay. Use at session start.
 
     Args:
         scope: Filter by scope (default: all)
         limit: Max results (default: 10)
+        max_tokens: Token budget limit — stops adding memories when exceeded (optional)
 
     Returns:
         List of recent memories
     """
     conn = _get_conn()
-    results = _db_get_recent_memory(conn, WORKSPACE_ID, scope, limit)
+    results = _db_get_recent_memory(conn, WORKSPACE_ID, scope, limit, max_tokens)
     if not results:
         return "No memories found for this workspace."
 
@@ -423,6 +445,88 @@ def summarize_scope(
     return "\n".join(lines)
 
 
+# ─── Tool: save_summary ─────────────────────────────────────────────
+
+@mcp.tool()
+def save_summary(
+    summary: str | None = None,
+    decisions: list[str] | None = None,
+    facts_learned: list[str] | None = None,
+    open_loops: list[str] | None = None,
+    refs: list[str] | None = None,
+    next_steps: str | None = None,
+) -> str:
+    """Save a structured session summary (handoff document). Call at session end.
+
+    Args:
+        summary: Free-form narrative of what happened this session
+        decisions: List of key decisions made
+        facts_learned: List of new facts discovered
+        open_loops: List of open loop titles/descriptions to carry forward
+        refs: List of relevant references (file paths, URLs, IDs)
+        next_steps: What to prioritize in the next session
+
+    Returns:
+        Confirmation with summary ID
+    """
+    conn = _get_conn()
+    summary_id = _db_save_summary(
+        conn, CRAFT_SESSION_ID, WORKSPACE_ID,
+        summary, decisions, facts_learned, open_loops, refs, next_steps,
+    )
+    _maybe_checkpoint(conn)
+    parts = []
+    if summary:
+        parts.append("summary")
+    if decisions:
+        parts.append(f"{len(decisions)} decisions")
+    if facts_learned:
+        parts.append(f"{len(facts_learned)} facts")
+    if open_loops:
+        parts.append(f"{len(open_loops)} open loops")
+    if next_steps:
+        parts.append("next_steps")
+    detail = ", ".join(parts) if parts else "empty"
+    return f"Session summary #{summary_id} saved ({detail})"
+
+
+# ─── Tool: update_memory ────────────────────────────────────────────
+
+@mcp.tool()
+def update_memory(
+    id: int,
+    content: str | None = None,
+    category: str | None = None,
+    importance: int | None = None,
+) -> str:
+    """Update an existing memory's content, category, or importance.
+
+    Args:
+        id: Memory ID to update
+        content: New content (optional)
+        category: New category: decision, discovery, bugfix, feature, refactor, change, note (optional)
+        importance: New importance 1-10 (optional)
+
+    Returns:
+        Confirmation or not-found notice
+    """
+    conn = _get_conn()
+    if content is not None:
+        content = _strip_private(content)
+    success = _db_update_memory(conn, id, WORKSPACE_ID, content, category, importance)
+    if success:
+        parts = []
+        if content is not None:
+            parts.append("content")
+        if category is not None:
+            parts.append("category")
+        if importance is not None:
+            parts.append("importance")
+        _maybe_checkpoint(conn)
+        return f"Memory #{id} updated: {', '.join(parts)}"
+    return f"Memory #{id} not found in workspace '{WORKSPACE_ID}'."
+
+
 # ─── Tool: run_maintenance ──────────────────────────────────────────
 
 @mcp.tool()
@@ -471,11 +575,10 @@ def search_by_tag(
 
     lines = [f"Memories tagged '{tag}' ({len(results)}):\n"]
     for r in results:
-        import json as _json
         tags_str = ""
         if r.get("tags"):
             try:
-                tags_str = f" tags={_json.loads(r['tags'])}"
+                tags_str = f" tags={json.loads(r['tags'])}"
             except Exception:
                 pass
         lines.append(
@@ -492,13 +595,13 @@ def run_server():
     """Start the MCP server with the configured transport."""
     if MCP_TRANSPORT == "http":
         import uvicorn
-        print(f"[craft-memory] v0.1.0 HTTP server on http://{MCP_HOST}:{MCP_PORT}/mcp", flush=True)
+        print(f"[craft-memory] v{_VERSION} HTTP server on http://{MCP_HOST}:{MCP_PORT}/mcp", flush=True)
         print(f"[craft-memory] Health: http://{MCP_HOST}:{MCP_PORT}/health", flush=True)
         print(f"[craft-memory] Workspace: {WORKSPACE_ID}", flush=True)
         app = mcp.streamable_http_app()
         uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
     else:
-        print(f"[craft-memory] v0.1.0 stdio server (workspace: {WORKSPACE_ID})", flush=True)
+        print(f"[craft-memory] v{_VERSION} stdio server (workspace: {WORKSPACE_ID})", flush=True)
         mcp.run(transport="stdio")
 
 

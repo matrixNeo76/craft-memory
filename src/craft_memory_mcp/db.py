@@ -211,8 +211,11 @@ def search_memory(
     except sqlite3.OperationalError:
         pass  # FTS5 query syntax error, fall back to LIKE
 
-    # Fallback: LIKE search
+    # Fallback: LIKE search — build params independently to avoid scope binding bug
     like_pattern = f"%{query}%"
+    like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+    if scope:
+        like_params.append(scope)
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
@@ -220,7 +223,7 @@ def search_memory(
             {scope_filter}
             ORDER BY importance DESC, created_at_epoch DESC
             LIMIT ?""",
-        params + [like_pattern, like_pattern] + [limit],
+        like_params + [limit],
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -230,6 +233,7 @@ def get_recent_memory(
     workspace_id: str,
     scope: str | None = None,
     limit: int = 10,
+    max_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """Get most relevant memories, ranked by importance with time decay."""
     scope_filter = "AND scope = ?" if scope else ""
@@ -253,6 +257,18 @@ def get_recent_memory(
         key=lambda m: _effective_importance(m["importance"], m["created_at_epoch"]),
         reverse=True,
     )
+
+    if max_tokens is not None:
+        budget = 0
+        result = []
+        for m in scored[:limit]:
+            token_est = len(m.get("content", "")) // 4
+            if budget + token_est > max_tokens:
+                break
+            budget += token_est
+            result.append(m)
+        return result
+
     return scored[:limit]
 
 
@@ -480,14 +496,19 @@ def summarize_scope(
     if scope != "all":
         params_mem.append(scope)
 
-    recent = conn.execute(
+    recent_rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
             {scope_filter}
             ORDER BY created_at_epoch DESC
-            LIMIT 20""",
+            LIMIT 60""",
         params_mem,
     ).fetchall()
+    recent = sorted(
+        [dict(r) for r in recent_rows],
+        key=lambda m: _effective_importance(m["importance"], m["created_at_epoch"]),
+        reverse=True,
+    )[:20]
 
     # Key facts
     params_facts: list[Any] = [workspace_id]
@@ -519,7 +540,7 @@ def summarize_scope(
     return {
         "workspace_id": workspace_id,
         "scope": scope,
-        "recent_memories": [dict(r) for r in recent],
+        "recent_memories": recent,
         "facts": [dict(r) for r in facts],
         "open_loops": [dict(r) for r in loops],
         "latest_summary": latest,
@@ -647,3 +668,36 @@ def search_by_tag(
         params + [limit],
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def update_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    content: str | None = None,
+    category: str | None = None,
+    importance: int | None = None,
+) -> bool:
+    """Update fields of an existing memory. Returns True if updated."""
+    updates = []
+    params: list[Any] = []
+    if content is not None:
+        updates.append("content = ?")
+        params.append(content)
+        updates.append("content_hash = ?")
+        params.append(_content_hash(content))
+    if category is not None:
+        updates.append("category = ?")
+        params.append(category)
+    if importance is not None:
+        updates.append("importance = ?")
+        params.append(importance)
+    if not updates:
+        return False
+    params += [memory_id, workspace_id]
+    cursor = conn.execute(
+        f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND workspace_id = ?",
+        params,
+    )
+    conn.commit()
+    return cursor.rowcount > 0
