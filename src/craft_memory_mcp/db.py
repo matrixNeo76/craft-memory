@@ -1744,3 +1744,55 @@ def list_procedures(
         (workspace_id, status, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Sprint 5 — Hierarchical Scopes + Coarse-to-Fine Retrieval
+# ---------------------------------------------------------------------------
+
+_SCOPE_ORDER = ["session", "project", "workspace", "user", "global"]
+
+
+def get_scope_ancestors(conn: sqlite3.Connection, scope: str) -> list[str]:
+    """Return scope + all ancestor scopes in order from specific to broad.
+
+    Uses scope_hierarchy table when available; falls back to the hardcoded
+    canonical order so the function works even before migration 010 runs.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT scope, level FROM scope_hierarchy ORDER BY level"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    if rows:
+        order = [r[0] for r in rows]  # already sorted by level
+    else:
+        order = _SCOPE_ORDER
+
+    try:
+        idx = order.index(scope)
+        return order[idx:]
+    except ValueError:
+        return [scope]
+
+
+def get_memory_bundle(
+    conn: sqlite3.Connection,
+    memory_ids: list[int],
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """Batch-fetch complete memory objects by ID list.
+
+    Returns only memories that belong to workspace_id.
+    Missing or cross-workspace IDs are silently skipped.
+    """
+    if not memory_ids:
+        return []
+    placeholders = ",".join("?" * len(memory_ids))
+    rows = conn.execute(
+        f"SELECT * FROM memories WHERE id IN ({placeholders}) AND workspace_id = ?",
+        (*memory_ids, workspace_id),
+    ).fetchall()
+    return [dict(r) for r in rows]

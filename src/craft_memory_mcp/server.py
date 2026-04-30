@@ -101,6 +101,8 @@ from craft_memory_mcp.db import (
     list_procedures as _db_list_procedures,
     save_procedure as _db_save_procedure,
     search_procedures as _db_search_procedures,
+    get_memory_bundle as _db_get_memory_bundle,
+    get_scope_ancestors as _db_get_scope_ancestors,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1230,6 +1232,24 @@ def get_applicable_procedures(current_context: str, limit: int = 5) -> str:
             f'{nl}    Steps:{nl}    {p["steps_md"][:300]}'
         )
     return nl.join(lines)
+
+
+@mcp.tool()
+def get_memory_bundle(memory_ids: list[int]) -> str:
+    """Batch-fetch complete memory objects by a list of IDs.
+
+    Layer 3 of the coarse-to-fine retrieval pattern: call this after
+    search_memory (Layer 1) and get_recent_memory/get_relations (Layer 2)
+    identified the IDs worth inspecting in full detail.
+
+    Returns full memory records as JSON. Missing or cross-workspace IDs
+    are silently skipped.
+    """
+    conn = _get_conn()
+    results = _db_get_memory_bundle(conn, memory_ids, WORKSPACE_ID)
+    if not results:
+        return "No memories found for the given IDs."
+    return json.dumps(results, default=str, ensure_ascii=False, indent=2)
 
 
 def run_server():
