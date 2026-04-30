@@ -137,6 +137,11 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 | **Bayesian confidence evolution** | `daily_maintenance` updates procedure confidence via `new = clamp(old×0.3 + avg_score×0.7, 0.05, 0.95)` using the last N outcomes; outcome scores: success=1.0, partial=0.5, failure=0.0 |
 | **Multi-hop graph context** | `get_graph_context` BFS traversal up to N hops: returns center memory + all reachable nodes/edges + `depth_map`; inbound + outbound traversal, cycle-safe via visited set |
 | **Batch memory save** | `batch_remember` saves N memories in one MCP call (JSON array input); duplicates return `None` in that slot without error; reduces round-trips in session-end automations |
+| **Procedure ranking** | `top_procedures` ranks active procedures by `confidence × success_rate × use_count` — shows which workflows are actually delivering value |
+| **Memory consolidation** | `consolidate_memories` combines low-value memories into a procedure in one call; `confirm=False` dry-run, `confirm=True` executes; all invalidations are soft (reversible) |
+| **Session quality scoring** | `rate_session` assigns a `quality_score` (0.0–1.0) to any session summary; feeds `get_high_quality_sessions` and `export_session_traces` |
+| **SessionDB** | `get_high_quality_sessions` and `export_session_traces` (JSONL) provide the data bridge for self-improvement loops, fine-tuning, and evaluation datasets (Hermes/GEPA pattern) |
+| **Prometheus metrics** | `GET /metrics` exposes memories, facts, open loops, procedures, avg confidence, db_size in Prometheus text format — Grafana-ready without MCP overhead |
 
 ---
 
@@ -192,6 +197,19 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 | **— Sprint 7: Graph Context + Batch Ops —** | |
 | `get_graph_context(memory_id, depth)` | BFS multi-hop traversal: return center memory + neighbors up to N hops with edges and `depth_map` |
 | `batch_remember(entries_json)` | Save N memories in one call (JSON array); duplicates return `None` without error; reduces round-trips |
+| **— Sprint 8: Procedure Intelligence + Session Quality —** | |
+| `top_procedures(limit)` | Rank procedures by `confidence × success_rate × use_count`; simmetrico di `god_facts` for procedures |
+| `consolidate_memories(candidate_ids_json, procedure_name, trigger_context, steps_md, confirm)` | Combine low-value memories into a procedure; `confirm=False` is dry-run (safe), `confirm=True` executes |
+| `rate_session(summary_id, score, notes)` | Assign quality score 0.0–1.0 to a session summary for SessionDB |
+| **— Sprint 9: SessionDB Foundation —** | |
+| `get_high_quality_sessions(min_score, limit)` | Return session summaries scored >= min_score; positive examples for self-improvement |
+| `export_session_traces(min_score, limit)` | Export rated sessions as JSONL for training, eval, or DSPy optimization |
+
+**HTTP Endpoints** (not MCP tools — direct HTTP):
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | JSON health check: status, db, version, workspace, db_size_mb |
+| `GET /metrics` | Prometheus text format: memories, facts, loops, procedures, avg confidence, db_size |
 
 ---
 
@@ -276,7 +294,7 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 41 tools, health check
+│   │   ├── server.py        # FastMCP server, 46 tools, /health + /metrics endpoints
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
 │   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
@@ -289,7 +307,8 @@ craft-memory/
 │   │   │   ├── 008_fact_temporal.sql   # lifecycle status + temporal fields
 │   │   │   ├── 009_procedures.sql      # procedural memory + FTS5 index
 │   │   │   ├── 010_scope_hierarchy.sql # scope hierarchy (session→global)
-│   │   │   └── 011_procedure_outcomes.sql # procedure execution outcomes + confidence evolution
+│   │   │   ├── 011_procedure_outcomes.sql # procedure execution outcomes + confidence evolution
+│   │   │   └── 012_session_quality.sql    # quality_score + quality_notes on session_summaries (SessionDB)
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -302,7 +321,7 @@ craft-memory/
 │   └── session-handoff/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
-├── tests/                   # pytest suite (168 tests: core, graph, observability, temporal, policy, procedures, scopes, exposed-tools, procedure-outcomes, graph-context, batch)
+├── tests/                   # pytest suite (209 tests: core, graph, observability, temporal, policy, procedures, scopes, exposed-tools, procedure-outcomes, graph-context, batch, top-procedures, consolidate, session-quality)
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```

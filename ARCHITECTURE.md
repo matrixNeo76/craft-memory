@@ -1,7 +1,7 @@
 # Craft Memory System — Complete Architectural Documentation
 
 > **Date**: 2026-04-30
-> **Version**: 6.0 (Sprint 1–7 — 41 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy, graph context, batch ops)
+> **Version**: 7.0 (Sprint 1–10 — 46 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy, graph context, batch ops, procedure intelligence, session quality, SessionDB)
 > **Environment**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -149,7 +149,7 @@ _PRIVATE_PATTERNS = _re.compile(
 )
 ```
 
-**41 tools exposed** (19 baseline + 22 added in Sprints 1–7):
+**46 tools exposed** (19 baseline + 27 added in Sprints 1–10) + 2 HTTP endpoints (`/health`, `/metrics`):
 
 | Tool | Purpose | R/W | Sprint |
 |------|---------|-----|--------|
@@ -194,6 +194,15 @@ _PRIVATE_PATTERNS = _re.compile(
 | `get_procedure_outcomes` | Return recent execution outcomes for a procedure, newest first | Read | Sprint 6 |
 | `get_graph_context` | BFS multi-hop traversal: return center memory + neighbors up to N hops with edges and depth_map | Read | Sprint 7 |
 | `batch_remember` | Save N memories in one call (JSON array input); reduces MCP round-trips for session-end automation | Write | Sprint 7 |
+| `top_procedures` | Rank procedures by `confidence × success_rate × use_count`; simmetrico di `god_facts` | Read | Sprint 8 |
+| `consolidate_memories` | Dry-run or execute: create procedure from candidates + invalidate originals; `confirm=False` is safe | Write | Sprint 8 |
+| `rate_session` | Assign quality_score (0.0–1.0) + notes to a session summary; feeds SessionDB | Write | Sprint 8 |
+| `get_high_quality_sessions` | Return session summaries with quality_score >= min_score; positive examples for self-improvement | Read | Sprint 9 |
+| `export_session_traces` | Export rated sessions as JSONL; training/eval bridge for DSPy, fine-tuning, eval harness | Read | Sprint 9 |
+
+**HTTP endpoints** (non-MCP, direct HTTP):
+- `GET /health` — JSON status: db state, version, workspace, db_size_mb (Sprint baseline)
+- `GET /metrics` — Prometheus text format: memories, facts, loops, procedures, avg confidence, db_size (Sprint 10)
 
 ### 3.2 File: `src/db.py`
 
@@ -288,6 +297,18 @@ SQLite data layer. Main functions:
 - `get_graph_context(conn, memory_id, workspace_id, depth=2) → dict|None` → BFS from `memory_id` up to `depth` hops; traverses both inbound and outbound edges; uses `visited` set to handle cycles safely; returns `{center, nodes[], edges[], depth_map, total_nodes, total_edges}`; returns `None` if memory not found or wrong workspace
 - `batch_remember(conn, entries, session_id, workspace_id) → list[int|None]` → saves N memories in one call; each entry dict accepts `content`, `category`, `importance`, `scope`, `tags`; duplicates return `None` in that slot without error; preserves order
 
+**Procedure Intelligence — Sprint 8**:
+- `get_top_procedures(conn, workspace_id, limit=10) → list[dict]` → ranks active procedures by `confidence × success_rate × use_count`; LEFT JOIN `procedure_outcomes`; zero-outcome procedures get `top_score=0.0`, `use_count=0`; simmetrico di `god_facts`
+- `consolidate_memories(conn, candidate_ids, workspace_id, procedure_name, trigger_context, steps_md, confirm=False) → dict` → dry-run (`confirm=False`): returns preview with `candidate_count`; confirm (`confirm=True`): calls `save_procedure` + `invalidate_memory` per each valid ID; returns `{dry_run, procedure_id, invalidated_count}`
+- `rate_session(conn, summary_id, workspace_id, score, notes=None) → bool` → UPDATE `session_summaries` with `quality_score` and `quality_notes`; returns `False` if summary not found or wrong workspace
+
+**SessionDB Foundation — Sprint 9**:
+- `get_high_quality_sessions(conn, workspace_id, min_score=0.7, limit=10) → list[dict]` → returns session summaries with `quality_score >= min_score`; NULL scores excluded; ordered by score desc
+- `export_session_traces(conn, workspace_id, min_score=None, limit=50) → str` → JSONL export (one JSON per line); `min_score=None` includes all scored sessions; unscored always excluded; returns `""` if no results
+
+**Observability — Sprint 10**:
+- `GET /metrics` HTTP endpoint → Prometheus text format; aggregates via `get_memory_stats()` + AVG confidence query + db_size; workspace-scoped labels
+
 ### 3.3 File: `src/schema.sql` + `src/migrations/`
 
 Base schema (v1) + versioned migrations:
@@ -306,6 +327,7 @@ Base schema (v1) + versioned migrations:
 | `procedures_fts` | Standalone FTS5 index for procedures (porter tokenizer) | migration 009 (Sprint 4) |
 | `scope_hierarchy` | Scope inheritance chain (session→project→workspace→user→global) | migration 010 (Sprint 5) |
 | `procedure_outcomes` | Execution outcome records (success/partial/failure) per procedure for confidence evolution | migration 011 (Sprint 6) |
+| `session_summaries` | Extended with `quality_score REAL` and `quality_notes TEXT` for SessionDB | migration 012 (Sprint 8) |
 
 **Applied migrations**:
 - `002_global_dedup.sql`: changes UNIQUE from `(session_id, content_hash)` to `(workspace_id, content_hash)`; recreates FTS5 with category/scope UNINDEXED
@@ -318,6 +340,7 @@ Base schema (v1) + versioned migrations:
 - `009_procedures.sql` (Sprint 4): creates `procedures` table with `UNIQUE(workspace_id, name)`; status `CHECK IN ('active','draft','deprecated')`; confidence `BETWEEN 0 AND 1`; standalone `procedures_fts USING fts5(name, trigger_context, steps_md, tokenize='porter ascii')`
 - `010_scope_hierarchy.sql` (Sprint 5): creates `scope_hierarchy` table with `scope` PK, `parent_scope` FK (self-referential), `level INTEGER`; seeds 5 canonical scopes: `session(0) → project(1) → workspace(2) → user(3) → global(4)`
 - `011_procedure_outcomes.sql` (Sprint 6): creates `procedure_outcomes` table with FK→`procedures(id)` CASCADE DELETE; `outcome CHECK IN ('success','partial','failure')`; two indexes: `(procedure_id, workspace_id)` and `(workspace_id, created_at_epoch DESC)`
+- `012_session_quality.sql` (Sprint 8): `ALTER TABLE session_summaries ADD COLUMN quality_score REAL CHECK(0.0–1.0)` and `quality_notes TEXT`; partial index `(workspace_id, quality_score DESC) WHERE quality_score IS NOT NULL`
 
 **`memory_relations` table** (introduced in v3.0, extended in v4.0):
 
