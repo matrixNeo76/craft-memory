@@ -205,9 +205,15 @@ def search_memory(
     workspace_id: str,
     scope: str | None = None,
     limit: int = 20,
+    include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
-    """Full-text search on memories. Returns list of matching memories."""
+    """Full-text search on memories. Returns list of matching memories.
+
+    By default excludes invalidated/superseded/needs_review memories.
+    Pass include_inactive=True to include all lifecycle statuses.
+    """
     scope_filter = "AND scope = ?" if scope else ""
+    lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
     params: list[Any] = [workspace_id]
     if scope:
         params.append(scope)
@@ -221,6 +227,7 @@ def search_memory(
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
                 {scope_filter}
+                {lifecycle_filter}
                 ORDER BY (bm25(memories_fts) * -1.0 * 0.7) + (m.importance * 0.3) DESC
                 LIMIT ?""",
             [fts_query] + params + [limit],
@@ -240,6 +247,7 @@ def search_memory(
             WHERE workspace_id = ?
             AND (content LIKE ? OR category LIKE ?)
             {scope_filter}
+            {lifecycle_filter}
             ORDER BY importance DESC, created_at_epoch DESC
             LIMIT ?""",
         like_params + [limit],
@@ -358,9 +366,15 @@ def get_recent_memory(
     scope: str | None = None,
     limit: int = 10,
     max_tokens: int | None = None,
+    include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
-    """Get most relevant memories, ranked by importance with time decay."""
+    """Get most relevant memories, ranked by importance with time decay.
+
+    By default excludes invalidated/superseded/needs_review memories.
+    Pass include_inactive=True to include all lifecycle statuses.
+    """
     scope_filter = "AND scope = ?" if scope else ""
+    lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
     params: list[Any] = [workspace_id]
     if scope:
         params.append(scope)
@@ -371,6 +385,7 @@ def get_recent_memory(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
             {scope_filter}
+            {lifecycle_filter}
             ORDER BY created_at_epoch DESC
             LIMIT ?""",
         params + [fetch_limit],
@@ -814,6 +829,10 @@ def daily_maintenance(
     trimmed = trim_session_summaries(conn, workspace_id, keep_last=20)
     deduped = dedup_memories(conn, workspace_id)
     pruned_edges = prune_inferred_edges(conn, workspace_id)
+    needs_review_row = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE workspace_id = ? AND lifecycle_status = 'needs_review'",
+        (workspace_id,),
+    ).fetchone()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.executescript("VACUUM;")
     return {
@@ -822,6 +841,7 @@ def daily_maintenance(
         "trimmed_summaries": trimmed,
         "deduped_memories": deduped,
         "inferred_edges_pruned": pruned_edges,
+        "needs_review": needs_review_row[0] if needs_review_row else 0,
     }
 
 
@@ -1375,3 +1395,127 @@ def generate_handoff(
         "recent_facts": [dict(r) for r in fact_rows],
         "memory_stats_snapshot": get_memory_stats(conn, workspace_id, scope=scope),
     }
+
+
+# --- Sprint 2: Temporal Invalidation + Review Flag ---
+
+
+def invalidate_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    reason: str,
+    workspace_id: str,
+    replaced_by_id: int | None = None,
+) -> bool:
+    """Mark a memory as invalidated.
+
+    Sets lifecycle_status='invalidated', valid_to=now, and optionally
+    links superseded_by to the replacement memory.
+    Returns True if the memory was found and updated, False otherwise.
+    """
+    row = conn.execute(
+        "SELECT id FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        """UPDATE memories
+           SET lifecycle_status = 'invalidated',
+               valid_to = ?,
+               superseded_by = COALESCE(?, superseded_by)
+           WHERE id = ? AND workspace_id = ?""",
+        (_now_epoch(), replaced_by_id, memory_id, workspace_id),
+    )
+    conn.commit()
+    return True
+
+
+def get_memory_history(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """Return the supersession chain starting from memory_id.
+
+    Follows superseded_by links forward. Returns a list of memory dicts
+    from oldest (given memory_id) to newest (final version with no superseded_by).
+    """
+    chain: list[dict[str, Any]] = []
+    current_id: int | None = memory_id
+    visited: set[int] = set()
+    while current_id is not None and current_id not in visited:
+        visited.add(current_id)
+        row = conn.execute(
+            "SELECT * FROM memories WHERE id = ? AND workspace_id = ?",
+            (current_id, workspace_id),
+        ).fetchone()
+        if row is None:
+            break
+        m = dict(row)
+        chain.append(m)
+        current_id = m.get("superseded_by")
+    return chain
+
+
+def flag_for_review(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    reason: str,
+    workspace_id: str,
+) -> bool:
+    """Mark a memory as needing human review (lifecycle_status='needs_review').
+
+    Returns True if the memory was found and updated, False otherwise.
+    """
+    row = conn.execute(
+        "SELECT id FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "UPDATE memories SET lifecycle_status = 'needs_review' WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    )
+    conn.commit()
+    return True
+
+
+def list_needs_review(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return memories with lifecycle_status='needs_review', ordered by importance desc."""
+    rows = conn.execute(
+        """SELECT * FROM memories
+           WHERE workspace_id = ? AND lifecycle_status = 'needs_review'
+           ORDER BY importance DESC, created_at_epoch DESC
+           LIMIT ?""",
+        (workspace_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def approve_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+) -> bool:
+    """Restore lifecycle_status to 'active' for a memory under review.
+
+    Returns True if the memory was found and updated, False otherwise.
+    """
+    row = conn.execute(
+        "SELECT id FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "UPDATE memories SET lifecycle_status = 'active' WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    )
+    conn.commit()
+    return True

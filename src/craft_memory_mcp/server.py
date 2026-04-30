@@ -90,6 +90,11 @@ from craft_memory_mcp.db import (
     explain_retrieval as _db_explain_retrieval,
     generate_handoff as _db_generate_handoff,
     get_memory_stats as _db_get_memory_stats,
+    approve_memory as _db_approve_memory,
+    flag_for_review as _db_flag_for_review,
+    get_memory_history as _db_get_memory_history,
+    invalidate_memory as _db_invalidate_memory,
+    list_needs_review as _db_list_needs_review,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1016,6 +1021,91 @@ def save_decision_record(
     if mem_id is None:
         return 'Duplicate decision record skipped.'
     return f'Decision record #{mem_id} saved: {title}'
+
+# --- Sprint 2: Temporal Invalidation + Review Flag ---
+
+@mcp.tool()
+def invalidate_memory(memory_id: int, reason: str) -> str:
+    """Mark a memory as invalidated (lifecycle_status='invalidated').
+
+    Use when a memory is no longer valid — e.g. a decision was reversed,
+    an assumption proved wrong, or information is stale.
+    The memory is preserved for history but excluded from search and retrieval.
+    """
+    conn = _get_conn()
+    ok = _db_invalidate_memory(conn, memory_id, reason, WORKSPACE_ID)
+    _maybe_checkpoint(conn)
+    if not ok:
+        return f'Memory #{memory_id} not found in this workspace.'
+    return f'Memory #{memory_id} marked as invalidated: {reason}'
+
+
+@mcp.tool()
+def get_memory_history(memory_id: int) -> str:
+    """Return the full supersession chain for a memory.
+
+    Follows superseded_by links to show how a memory evolved over time.
+    Useful for understanding the history of a decision or fact.
+    """
+    conn = _get_conn()
+    chain = _db_get_memory_history(conn, memory_id, WORKSPACE_ID)
+    if not chain:
+        return f'Memory #{memory_id} not found.'
+    nl = chr(10)
+    lines = [f'History chain for memory #{memory_id} ({len(chain)} entries):']
+    for i, m in enumerate(chain):
+        status = m.get('lifecycle_status') or 'active'
+        lines.append(f'  [{i+1}] #{m["id"]} [{status}] {m["content"][:120]}')
+    return nl.join(lines)
+
+
+@mcp.tool()
+def flag_for_review(memory_id: int, reason: str) -> str:
+    """Flag a memory for human review (lifecycle_status='needs_review').
+
+    Use when a memory might be incorrect, outdated, or needs verification.
+    Flagged memories are excluded from default search and retrieval until approved.
+    """
+    conn = _get_conn()
+    ok = _db_flag_for_review(conn, memory_id, reason, WORKSPACE_ID)
+    _maybe_checkpoint(conn)
+    if not ok:
+        return f'Memory #{memory_id} not found in this workspace.'
+    return f'Memory #{memory_id} flagged for review: {reason}'
+
+
+@mcp.tool()
+def list_needs_review(limit: int = 20) -> str:
+    """List memories currently flagged for human review.
+
+    Returns memories with lifecycle_status='needs_review', ordered by importance.
+    Use approve_memory or invalidate_memory to process each entry.
+    """
+    conn = _get_conn()
+    items = _db_list_needs_review(conn, WORKSPACE_ID, limit=limit)
+    if not items:
+        return 'No memories pending review.'
+    nl = chr(10)
+    lines = [f'Memories pending review ({len(items)}):']
+    for m in items:
+        lines.append(f'  #{m["id"]} [importance={m["importance"]}] {m["content"][:120]}')
+    return nl.join(lines)
+
+
+@mcp.tool()
+def approve_memory(memory_id: int) -> str:
+    """Approve a memory under review, restoring it to active status.
+
+    Sets lifecycle_status back to 'active' so the memory reappears in
+    search and retrieval results.
+    """
+    conn = _get_conn()
+    ok = _db_approve_memory(conn, memory_id, WORKSPACE_ID)
+    _maybe_checkpoint(conn)
+    if not ok:
+        return f'Memory #{memory_id} not found in this workspace.'
+    return f'Memory #{memory_id} approved and restored to active status.'
+
 
 def run_server():
     """Start the MCP server with the configured transport."""
