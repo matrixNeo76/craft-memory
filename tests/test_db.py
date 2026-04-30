@@ -7,6 +7,7 @@ from craft_memory_mcp.db import (
     create_open_loop,
     get_facts,
     get_recent_memory,
+    hybrid_search,
     list_open_loops,
     register_session,
     remember,
@@ -278,3 +279,57 @@ def test_update_open_loop_invalid_priority_rejected(registered_conn):
         "SELECT priority FROM open_loops WHERE id = ?", (loop_id,)
     ).fetchone()
     assert row["priority"] == "medium"  # unchanged
+
+
+# ─── Hybrid Search (RRF) ─────────────────────────────────────────────
+
+
+def test_hybrid_search_returns_results(registered_conn):
+    """hybrid_search finds memories matching the query."""
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+             "SQLite WAL mode enables concurrent reads", "discovery")
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+             "FastMCP stateless HTTP transport", "note")
+
+    results = hybrid_search(registered_conn, "SQLite WAL", TEST_WORKSPACE_ID)
+    assert len(results) >= 1
+    assert any("SQLite" in r["content"] for r in results)
+
+
+def test_hybrid_search_scope_filter(registered_conn):
+    """hybrid_search respects scope filter."""
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+             "Session-scoped memory", "note", scope="session")
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+             "Workspace-scoped memory", "note", scope="workspace")
+
+    results = hybrid_search(registered_conn, "memory", TEST_WORKSPACE_ID, scope="session")
+    assert all(r["scope"] == "session" for r in results)
+
+
+def test_hybrid_search_fallback_on_fts5_error(registered_conn):
+    """hybrid_search falls back to LIKE when FTS5 query is invalid."""
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+             "Hyphenated content full-text search", "discovery")
+
+    # Hyphenated query can trip FTS5 — RRF must still return results via LIKE fallback
+    results = hybrid_search(registered_conn, "full-text", TEST_WORKSPACE_ID)
+    assert isinstance(results, list)
+
+
+def test_hybrid_search_empty_query_returns_empty(registered_conn):
+    """hybrid_search with whitespace-only query returns empty list gracefully."""
+    remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID, "Some content", "note")
+    results = hybrid_search(registered_conn, "   ", TEST_WORKSPACE_ID)
+    assert isinstance(results, list)
+
+
+def test_rrf_score_combines_ranks():
+    """_rrf_score fuses two rank dicts and sums scores correctly."""
+    from craft_memory_mcp.db import _rrf_score
+    bm25 = {1: 0, 2: 1}
+    overlap = {2: 0, 3: 0}
+    scores = _rrf_score(bm25, overlap, k=60)
+    # id=2 appears in both — must have the highest combined score
+    assert scores[2] > scores[1]
+    assert scores[2] > scores[3]

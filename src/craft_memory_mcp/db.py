@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -235,6 +236,111 @@ def search_memory(
         like_params + [limit],
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _rrf_score(
+    bm25_ranks: dict[int, int],
+    overlap_ranks: dict[int, int],
+    k: int = 60,
+) -> dict[int, float]:
+    """Reciprocal Rank Fusion across two ranking lists.
+
+    bm25_ranks / overlap_ranks: {memory_id: rank_position (0-based)}
+    Returns {memory_id: rrf_score}
+    """
+    scores: dict[int, float] = {}
+    for mem_id, rank in bm25_ranks.items():
+        scores[mem_id] = scores.get(mem_id, 0.0) + 1.0 / (k + rank + 1)
+    for mem_id, rank in overlap_ranks.items():
+        scores[mem_id] = scores.get(mem_id, 0.0) + 1.0 / (k + rank + 1)
+    return scores
+
+
+def hybrid_search(
+    conn: sqlite3.Connection,
+    query: str,
+    workspace_id: str,
+    scope: str | None = None,
+    limit: int = 20,
+    k: int = 60,
+) -> list[dict[str, Any]]:
+    """RRF Hybrid Search: fuses BM25 (FTS5) + word-overlap ranking.
+
+    No embeddings required. Both sources use only FTS5 + Python math.
+    Falls back to LIKE search if FTS5 pool is empty.
+    """
+    scope_filter = "AND m.scope = ?" if scope else ""
+    base_params: list[Any] = [workspace_id]
+    if scope:
+        base_params.append(scope)
+
+    pool_limit = limit * 3
+
+    # Source 1: BM25 via FTS5
+    bm25_rows: list[dict] = []
+    try:
+        fts_query = query.replace('"', '""')
+        rows = conn.execute(
+            f"""SELECT m.*, bm25(memories_fts) AS bm25_score
+                FROM memories m
+                JOIN memories_fts fts ON m.id = fts.rowid
+                WHERE memories_fts MATCH ?
+                AND m.workspace_id = ?
+                {scope_filter}
+                ORDER BY bm25(memories_fts) ASC
+                LIMIT ?""",
+            [fts_query] + base_params + [pool_limit],
+        ).fetchall()
+        bm25_rows = [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        pass
+
+    # Source 2: Word-overlap (Jaccard-like on query terms)
+    query_words = set(re.sub(r"[^a-zA-Z0-9\s]", "", query).lower().split())
+    overlap_rows: list[dict] = []
+    if bm25_rows and query_words:
+        all_ids = [r["id"] for r in bm25_rows]
+        id_placeholders = ",".join("?" * len(all_ids))
+        candidate_rows = conn.execute(
+            f"SELECT id, content FROM memories WHERE id IN ({id_placeholders})",
+            all_ids,
+        ).fetchall()
+        scored: list[tuple[int, float]] = []
+        for row in candidate_rows:
+            mem_words = set(re.sub(r"[^a-zA-Z0-9\s]", "", row["content"]).lower().split())
+            union = len(query_words | mem_words)
+            overlap = len(query_words & mem_words) / union if union else 0.0
+            scored.append((row["id"], overlap))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        overlap_rows = [{"id": mid, "overlap": ov} for mid, ov in scored]
+
+    # RRF Fusion
+    bm25_ranks = {r["id"]: i for i, r in enumerate(bm25_rows)}
+    overlap_ranks = {r["id"]: i for i, r in enumerate(overlap_rows)}
+    rrf_scores = _rrf_score(bm25_ranks, overlap_ranks, k=k)
+
+    bm25_by_id = {r["id"]: r for r in bm25_rows}
+    sorted_ids = sorted(rrf_scores.keys(), key=lambda mid: rrf_scores[mid], reverse=True)
+    results = [bm25_by_id[mid] for mid in sorted_ids if mid in bm25_by_id][:limit]
+
+    # Fallback LIKE if pool is empty
+    if not results:
+        like_pattern = f"%{query}%"
+        like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+        if scope:
+            like_params.append(scope)
+        scope_like_filter = "AND scope = ?" if scope else ""
+        fallback_rows = conn.execute(
+            f"""SELECT * FROM memories
+                WHERE workspace_id = ? AND (content LIKE ? OR category LIKE ?)
+                {scope_like_filter}
+                ORDER BY importance DESC, created_at_epoch DESC
+                LIMIT ?""",
+            like_params + [limit],
+        ).fetchall()
+        results = [dict(r) for r in fallback_rows]
+
+    return results
 
 
 def get_recent_memory(

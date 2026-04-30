@@ -64,6 +64,7 @@ from craft_memory_mcp.db import (
     delete_old_memories as _db_delete_old_memories,
     find_similar_memories as _db_find_similar_memories,
     get_connection as _db_get_connection,
+    hybrid_search as _db_hybrid_search,
     get_facts as _db_get_facts,
     get_latest_summary as _db_get_latest_summary,
     get_recent_memory as _db_get_recent_memory,
@@ -229,19 +230,24 @@ def search_memory(
     query: str,
     scope: str | None = None,
     limit: int = 20,
+    use_rrf: bool = True,
 ) -> str:
-    """Search memories using full-text search. Returns matching memories with IDs.
+    """Search memories using full-text search with RRF hybrid ranking.
 
     Args:
         query: Search query (keywords, phrases)
         scope: Filter by scope (default: all)
         limit: Max results (default: 20)
+        use_rrf: Use RRF hybrid ranking (BM25 + word-overlap fusion). Default True.
 
     Returns:
         List of matching memories
     """
     conn = _get_conn()
-    results = _db_search_memory(conn, query, WORKSPACE_ID, scope, limit)
+    if use_rrf:
+        results = _db_hybrid_search(conn, query, WORKSPACE_ID, scope=scope, limit=limit)
+    else:
+        results = _db_search_memory(conn, query, WORKSPACE_ID, scope, limit)
     if not results:
         return "No memories found matching your query."
 
