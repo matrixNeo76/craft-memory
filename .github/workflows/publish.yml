@@ -1,9 +1,8 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]  # triggered when release-please merges the release PR
 
 jobs:
   build-and-publish:
