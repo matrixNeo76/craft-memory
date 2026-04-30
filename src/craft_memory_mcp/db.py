@@ -833,6 +833,11 @@ def daily_maintenance(
         "SELECT COUNT(*) FROM memories WHERE workspace_id = ? AND lifecycle_status = 'needs_review'",
         (workspace_id,),
     ).fetchone()
+    # Sprint 6: evolve procedure confidence from recorded outcomes
+    try:
+        procedures_updated = _update_all_procedure_confidences(conn, workspace_id)
+    except Exception:
+        procedures_updated = 0
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.executescript("VACUUM;")
     return {
@@ -842,6 +847,7 @@ def daily_maintenance(
         "deduped_memories": deduped,
         "inferred_edges_pruned": pruned_edges,
         "needs_review": needs_review_row[0] if needs_review_row else 0,
+        "procedures_confidence_updated": procedures_updated,
     }
 
 
@@ -1796,3 +1802,107 @@ def get_memory_bundle(
         (*memory_ids, workspace_id),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Procedure Outcome Tracking + Confidence Evolution
+# ---------------------------------------------------------------------------
+
+_VALID_OUTCOMES = {"success", "partial", "failure"}
+_OUTCOME_SCORES = {"success": 1.0, "partial": 0.5, "failure": 0.0}
+
+
+def record_procedure_outcome(
+    conn: sqlite3.Connection,
+    procedure_id: int,
+    workspace_id: str,
+    outcome: str,
+    notes: str | None = None,
+) -> int:
+    """Record an execution outcome for a procedure. Returns outcome row id.
+
+    outcome must be 'success', 'partial', or 'failure'.
+    """
+    if outcome not in _VALID_OUTCOMES:
+        raise ValueError(f"outcome must be one of {sorted(_VALID_OUTCOMES)!r}, got {outcome!r}")
+    cursor = conn.execute(
+        """INSERT INTO procedure_outcomes
+           (procedure_id, workspace_id, outcome, notes, created_at_epoch)
+           VALUES (?, ?, ?, ?, ?)""",
+        (procedure_id, workspace_id, outcome, notes, _now_epoch()),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_procedure_outcomes(
+    conn: sqlite3.Connection,
+    procedure_id: int,
+    workspace_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return the most recent outcomes for a procedure, newest first."""
+    rows = conn.execute(
+        """SELECT * FROM procedure_outcomes
+           WHERE procedure_id = ? AND workspace_id = ?
+           ORDER BY created_at_epoch DESC
+           LIMIT ?""",
+        (procedure_id, workspace_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_procedure_confidence(
+    conn: sqlite3.Connection,
+    procedure_id: int,
+    workspace_id: str,
+    recent_n: int = 10,
+) -> float | None:
+    """Recalculate and persist confidence for a procedure based on recent outcomes.
+
+    Uses a Bayesian-style blend: new_confidence = old * 0.3 + outcome_avg * 0.7.
+    Outcome scores: success=1.0, partial=0.5, failure=0.0.
+    Result is clamped to [0.05, 0.95].
+    Returns the new confidence value, or None if no outcomes exist.
+    """
+    rows = conn.execute(
+        """SELECT outcome FROM procedure_outcomes
+           WHERE procedure_id = ? AND workspace_id = ?
+           ORDER BY created_at_epoch DESC
+           LIMIT ?""",
+        (procedure_id, workspace_id, recent_n),
+    ).fetchall()
+    if not rows:
+        return None
+
+    avg_score = sum(_OUTCOME_SCORES[r["outcome"]] for r in rows) / len(rows)
+
+    proc = conn.execute(
+        "SELECT confidence FROM procedures WHERE id = ? AND workspace_id = ?",
+        (procedure_id, workspace_id),
+    ).fetchone()
+    if not proc:
+        return None
+
+    old_conf = proc["confidence"]
+    new_conf = max(0.05, min(0.95, old_conf * 0.3 + avg_score * 0.7))
+    conn.execute(
+        "UPDATE procedures SET confidence = ?, updated_at_epoch = ? WHERE id = ? AND workspace_id = ?",
+        (new_conf, _now_epoch(), procedure_id, workspace_id),
+    )
+    conn.commit()
+    return new_conf
+
+
+def _update_all_procedure_confidences(conn: sqlite3.Connection, workspace_id: str) -> int:
+    """Update confidence for all procedures that have at least one outcome. Returns count updated."""
+    proc_ids = conn.execute(
+        """SELECT DISTINCT procedure_id FROM procedure_outcomes WHERE workspace_id = ?""",
+        (workspace_id,),
+    ).fetchall()
+    updated = 0
+    for row in proc_ids:
+        result = update_procedure_confidence(conn, row["procedure_id"], workspace_id)
+        if result is not None:
+            updated += 1
+    return updated

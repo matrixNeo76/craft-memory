@@ -103,6 +103,11 @@ from craft_memory_mcp.db import (
     search_procedures as _db_search_procedures,
     get_memory_bundle as _db_get_memory_bundle,
     get_scope_ancestors as _db_get_scope_ancestors,
+    search_facts as _db_search_facts,
+    list_procedures as _db_list_procedures_all,
+    find_consolidation_candidates as _db_find_consolidation_candidates,
+    record_procedure_outcome as _db_record_procedure_outcome,
+    get_procedure_outcomes as _db_get_procedure_outcomes,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1250,6 +1255,119 @@ def get_memory_bundle(memory_ids: list[int]) -> str:
     if not results:
         return "No memories found for the given IDs."
     return json.dumps(results, default=str, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def search_facts(query: str, scope: str | None = None, limit: int = 20) -> str:
+    """Search stable facts by keyword (matches key or value).
+
+    Complements god_facts (top-ranked) with keyword-driven lookup.
+    Use when you remember part of a fact key or value but not the exact name.
+    """
+    conn = _get_conn()
+    results = _db_search_facts(conn, query, WORKSPACE_ID, scope=scope)
+    if not results:
+        return f"No facts found matching '{query}'."
+    results = results[:limit]
+    nl = chr(10)
+    lines = [f"Facts matching '{query}' ({len(results)}):"]
+    for f in results:
+        lines.append(
+            f"  [{f['scope']}] {f['key']} = {f['value']}"
+            f"  (confidence={f['confidence']:.2f}, type={f['confidence_type']})"
+        )
+    return nl.join(lines)
+
+
+@mcp.tool()
+def list_procedures(status: str = "active", limit: int = 20) -> str:
+    """[admin] List all procedures for the current workspace filtered by status.
+
+    status options: active | draft | deprecated
+    Use this to review what reusable workflows are available before starting a task.
+    """
+    conn = _get_conn()
+    results = _db_list_procedures_all(conn, WORKSPACE_ID, status=status, limit=limit)
+    if not results:
+        return f"No {status} procedures found."
+    nl = chr(10)
+    lines = [f"{status.capitalize()} procedures ({len(results)}):"]
+    for p in results:
+        lines.append(
+            f"  #{p['id']} \"{p['name']}\" (confidence={p['confidence']:.2f})"
+            f"{nl}    Trigger: {p['trigger_context'][:120]}"
+        )
+    return nl.join(lines)
+
+
+@mcp.tool()
+def get_scope_ancestors(scope: str) -> str:
+    """Return the ancestor chain for a scope level, from most specific to broadest.
+
+    Hierarchy: session < project < workspace < user < global
+    Example: get_scope_ancestors('project') → ['project', 'workspace', 'user', 'global']
+    Use to understand which broader scopes will be searched on a scope-fallback query.
+    """
+    conn = _get_conn()
+    ancestors = _db_get_scope_ancestors(conn, scope)
+    return json.dumps(ancestors, ensure_ascii=False)
+
+
+@mcp.tool()
+def consolidation_candidates(importance_threshold: float = 2.0, age_days: int = 30) -> str:
+    """[admin] Find old memories with low effective importance — candidates for consolidation.
+
+    Returns non-core memories older than age_days with effective_importance < threshold.
+    Use in SchedulerTick to surface memories ready for promotion to fact or deletion.
+    """
+    conn = _get_conn()
+    results = _db_find_consolidation_candidates(
+        conn, WORKSPACE_ID,
+        importance_threshold=importance_threshold,
+        age_days=age_days,
+    )
+    if not results:
+        return "No consolidation candidates found."
+    nl = chr(10)
+    lines = [f"Consolidation candidates ({len(results)}):"]
+    for m in results:
+        eff = m.get("effective_importance", 0)
+        lines.append(
+            f"  #{m['id']} [{m['category']}] eff={eff:.3f} — {m['content'][:120]}"
+        )
+    return nl.join(lines)
+
+
+@mcp.tool()
+def record_procedure_outcome(procedure_id: int, outcome: str, notes: str | None = None) -> str:
+    """Record the execution result of a procedure (success / partial / failure).
+
+    Call this after executing a procedure to track its real-world effectiveness.
+    The confidence score evolves automatically during nightly maintenance.
+
+    outcome: 'success' | 'partial' | 'failure'
+    notes: optional free-text context about what worked or failed
+    """
+    conn = _get_conn()
+    try:
+        outcome_id = _db_record_procedure_outcome(conn, procedure_id, WORKSPACE_ID, outcome, notes)
+        return f"Outcome recorded (id={outcome_id}). Procedure #{procedure_id} confidence will be updated in next maintenance run."
+    except ValueError as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_procedure_outcomes(procedure_id: int, limit: int = 20) -> str:
+    """Return recent execution outcomes for a procedure, newest first.
+
+    Use to audit whether a procedure is performing reliably before deciding
+    to promote, demote, or deprecate it.
+    """
+    conn = _get_conn()
+    outcomes = _db_get_procedure_outcomes(conn, procedure_id, WORKSPACE_ID, limit=limit)
+    if not outcomes:
+        return f"No outcomes recorded for procedure #{procedure_id}."
+    return json.dumps(outcomes, default=str, ensure_ascii=False, indent=2)
 
 
 def run_server():
