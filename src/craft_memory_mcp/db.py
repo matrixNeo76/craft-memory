@@ -1906,3 +1906,116 @@ def _update_all_procedure_confidences(conn: sqlite3.Connection, workspace_id: st
         if result is not None:
             updated += 1
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Sprint 7 — Multi-hop Graph Context + Batch Remember
+# ---------------------------------------------------------------------------
+
+def get_graph_context(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    depth: int = 2,
+) -> dict[str, Any] | None:
+    """BFS from memory_id up to `depth` hops in the knowledge graph.
+
+    Returns a context dict with:
+      center      — the root memory dict
+      nodes       — all unique memories encountered (including center)
+      edges       — all traversed edge dicts (with relation, role, weight)
+      depth_map   — {memory_id: hop_distance_from_center}
+      total_nodes / total_edges — summary counts
+
+    Returns None if memory_id does not exist in workspace_id.
+    Handles cycles safely (visited set prevents re-traversal).
+    Traverses both inbound and outbound edges at each hop.
+    """
+    center_row = conn.execute(
+        "SELECT * FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if not center_row:
+        return None
+
+    center_dict = dict(center_row)
+    visited: set[int] = {memory_id}
+    depth_map: dict[int, int] = {memory_id: 0}
+    nodes: dict[int, dict[str, Any]] = {memory_id: center_dict}
+    edges: list[dict[str, Any]] = []
+    seen_edges: set[int] = set()
+
+    frontier = [memory_id]
+    for current_depth in range(1, depth + 1):
+        if not frontier:
+            break
+        next_frontier: list[int] = []
+        for mid in frontier:
+            edge_rows = conn.execute(
+                """SELECT mr.*
+                   FROM memory_relations mr
+                   WHERE (mr.source_id = ? OR mr.target_id = ?)
+                   AND mr.workspace_id = ?""",
+                (mid, mid, workspace_id),
+            ).fetchall()
+
+            for edge_row in edge_rows:
+                edge_dict = dict(edge_row)
+                edge_id: int = edge_dict["id"]
+                if edge_id in seen_edges:
+                    continue
+                seen_edges.add(edge_id)
+                edges.append(edge_dict)
+
+                neighbor_id = (
+                    edge_dict["target_id"]
+                    if edge_dict["source_id"] == mid
+                    else edge_dict["source_id"]
+                )
+                if neighbor_id not in visited:
+                    visited.add(neighbor_id)
+                    depth_map[neighbor_id] = current_depth
+                    next_frontier.append(neighbor_id)
+                    neighbor_row = conn.execute(
+                        "SELECT * FROM memories WHERE id = ? AND workspace_id = ?",
+                        (neighbor_id, workspace_id),
+                    ).fetchone()
+                    if neighbor_row:
+                        nodes[neighbor_id] = dict(neighbor_row)
+        frontier = next_frontier
+
+    return {
+        "center": center_dict,
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "depth_map": depth_map,
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+    }
+
+
+def batch_remember(
+    conn: sqlite3.Connection,
+    entries: list[dict[str, Any]],
+    session_id: str,
+    workspace_id: str,
+) -> list[int | None]:
+    """Save multiple memories in one operation. Returns list of IDs (None for duplicates).
+
+    Each entry dict supports keys: content (required), category, importance, scope, tags.
+    Duplicate content (same workspace content_hash) returns None for that slot — no error.
+    """
+    results: list[int | None] = []
+    for entry in entries:
+        mid = remember(
+            conn,
+            session_id,
+            workspace_id,
+            content=entry.get("content", ""),
+            category=entry.get("category", "note"),
+            importance=int(entry.get("importance", 5)),
+            scope=entry.get("scope", "workspace"),
+            tags=entry.get("tags"),
+        )
+        results.append(mid)
+    return results

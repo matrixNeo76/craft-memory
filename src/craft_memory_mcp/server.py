@@ -108,6 +108,8 @@ from craft_memory_mcp.db import (
     find_consolidation_candidates as _db_find_consolidation_candidates,
     record_procedure_outcome as _db_record_procedure_outcome,
     get_procedure_outcomes as _db_get_procedure_outcomes,
+    get_graph_context as _db_get_graph_context,
+    batch_remember as _db_batch_remember,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1368,6 +1370,58 @@ def get_procedure_outcomes(procedure_id: int, limit: int = 20) -> str:
     if not outcomes:
         return f"No outcomes recorded for procedure #{procedure_id}."
     return json.dumps(outcomes, default=str, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_graph_context(memory_id: int, depth: int = 2) -> str:
+    """BFS graph traversal: return a memory and all its neighbors up to `depth` hops.
+
+    This is the neighborhood context tool for deep reasoning on memory chains.
+    Use after search_memory or get_memory_bundle identifies a relevant memory —
+    explore its knowledge graph neighborhood without N separate get_relations calls.
+
+    Returns JSON with: center, nodes[], edges[], depth_map, total_nodes, total_edges.
+    depth=1 → direct neighbors only; depth=2 → neighbors of neighbors (default).
+    Handles cycles safely. Traverses both inbound and outbound edges.
+    """
+    conn = _get_conn()
+    result = _db_get_graph_context(conn, memory_id, WORKSPACE_ID, depth=depth)
+    if result is None:
+        return f"Memory #{memory_id} not found in workspace."
+    return json.dumps(result, default=str, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def batch_remember(entries_json: str) -> str:
+    """Save multiple memories in one call to reduce MCP round-trips.
+
+    Pass a JSON array of entry objects. Each entry supports:
+      content (required), category, importance (1-10), scope, tags (array)
+
+    Example:
+      [
+        {"content": "fixed auth bug", "category": "bugfix", "importance": 8},
+        {"content": "API uses JWT", "category": "discovery", "importance": 7}
+      ]
+
+    Returns a summary of how many memories were saved vs. skipped as duplicates.
+    """
+    conn = _get_conn()
+    try:
+        entries = json.loads(entries_json)
+        if not isinstance(entries, list):
+            return "Error: input must be a JSON array of entry objects."
+    except (json.JSONDecodeError, ValueError) as exc:
+        return f"Error: invalid JSON — {exc}"
+
+    ids = _db_batch_remember(conn, entries, CRAFT_SESSION_ID, WORKSPACE_ID)
+    saved = sum(1 for i in ids if i is not None)
+    dupes = len(ids) - saved
+    parts = [f"Batch complete: {saved} saved, {dupes} duplicate(s) skipped."]
+    for entry, mid in zip(entries, ids):
+        status = f"id={mid}" if mid else "duplicate"
+        parts.append(f"  [{status}] {entry.get('content', '')[:80]}")
+    return chr(10).join(parts)
 
 
 def run_server():
