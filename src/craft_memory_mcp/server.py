@@ -97,6 +97,10 @@ from craft_memory_mcp.db import (
     list_needs_review as _db_list_needs_review,
     MemoryClass as _MemoryClass,
     classify_memory_event as _db_classify_memory_event,
+    get_applicable_procedures as _db_get_applicable_procedures,
+    list_procedures as _db_list_procedures,
+    save_procedure as _db_save_procedure,
+    search_procedures as _db_search_procedures,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1143,6 +1147,88 @@ def classify_event(
         f"Reason: {reason}",
         f"Recommended action: {action_map[cls]}",
     ]
+    return nl.join(lines)
+
+
+# --- Sprint 4: Procedural Memory ---
+
+@mcp.tool()
+def save_procedure(
+    name: str,
+    trigger_context: str,
+    steps_md: str,
+    confidence: float = 0.5,
+    source_memory_ids: str = "",
+    status: str = "active",
+) -> str:
+    """Save or update a reusable procedure (step-by-step pattern).
+
+    Procedures capture recurring workflows so they can be retrieved and applied
+    in future sessions. Upserts by name — calling again with the same name updates it.
+
+    Args:
+        name: Short unique identifier (e.g. 'deploy-backend', 'code-review-process')
+        trigger_context: When to apply this procedure (natural language description)
+        steps_md: Markdown-formatted steps (e.g. '1. Pull main\\n2. Run tests\\n3. Deploy')
+        confidence: How reliable is this procedure (0.0–1.0, default 0.5)
+        source_memory_ids: Comma-separated memory IDs that inspired this procedure (optional)
+        status: 'active' | 'draft' | 'deprecated'
+    """
+    conn = _get_conn()
+    src_ids = None
+    if source_memory_ids.strip():
+        try:
+            src_ids = [int(x.strip()) for x in source_memory_ids.split(",") if x.strip()]
+        except ValueError:
+            pass
+    pid = _db_save_procedure(
+        conn, WORKSPACE_ID, name, trigger_context, steps_md,
+        confidence=confidence, source_memory_ids=src_ids, status=status,
+    )
+    _maybe_checkpoint(conn)
+    return f'Procedure #{pid} "{name}" saved (confidence={confidence}, status={status}).'
+
+
+@mcp.tool()
+def search_procedures(query: str, limit: int = 10) -> str:
+    """Search procedures by name, trigger context, or steps content (FTS5).
+
+    Use to find relevant procedures before starting a task or when looking for
+    established workflows in this workspace.
+    """
+    conn = _get_conn()
+    results = _db_search_procedures(conn, query, WORKSPACE_ID, limit=limit)
+    if not results:
+        return f'No procedures found matching "{query}".'
+    nl = chr(10)
+    lines = [f'Procedures matching "{query}" ({len(results)}):']
+    for p in results:
+        lines.append(
+            f'  #{p["id"]} [{p["status"]}] "{p["name"]}" (confidence={p["confidence"]:.2f})'
+            f'{nl}    Trigger: {p["trigger_context"][:100]}'
+        )
+    return nl.join(lines)
+
+
+@mcp.tool()
+def get_applicable_procedures(current_context: str, limit: int = 5) -> str:
+    """Find the most applicable procedures for the current task context.
+
+    Call at the start of a task to retrieve relevant workflows. Returns active
+    procedures ranked by relevance and confidence.
+    """
+    conn = _get_conn()
+    results = _db_get_applicable_procedures(conn, current_context, WORKSPACE_ID, limit=limit)
+    if not results:
+        return 'No applicable procedures found for this context.'
+    nl = chr(10)
+    lines = [f'Applicable procedures ({len(results)}):']
+    for p in results:
+        lines.append(
+            f'  #{p["id"]} "{p["name"]}" (confidence={p["confidence"]:.2f})'
+            f'{nl}    Trigger: {p["trigger_context"][:100]}'
+            f'{nl}    Steps:{nl}    {p["steps_md"][:300]}'
+        )
     return nl.join(lines)
 
 

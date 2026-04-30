@@ -1607,3 +1607,140 @@ def classify_memory_event(
 
     # Default → episodic memory
     return MemoryClass.EPISODIC, "general episodic memory"
+
+
+# --- Sprint 4: Procedural Memory ---
+
+
+def save_procedure(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    name: str,
+    trigger_context: str,
+    steps_md: str,
+    confidence: float = 0.5,
+    source_memory_ids: list[int] | None = None,
+    status: str = "active",
+) -> int:
+    """Upsert a procedure (keyed by workspace_id + name). Returns procedure id.
+
+    If a procedure with the same name already exists in the workspace it is
+    updated in place; the FTS5 index is kept in sync via explicit delete/insert.
+    """
+    now_epoch = _now_epoch()
+    src_ids_json = json.dumps(source_memory_ids) if source_memory_ids else None
+
+    existing = conn.execute(
+        "SELECT id FROM procedures WHERE workspace_id = ? AND name = ?",
+        (workspace_id, name),
+    ).fetchone()
+
+    if existing:
+        proc_id: int = existing["id"]
+        # Read OLD FTS values before updating — FTS5 delete requires exact old content
+        old_row = conn.execute(
+            "SELECT name, trigger_context, steps_md FROM procedures WHERE id = ?",
+            (proc_id,),
+        ).fetchone()
+        conn.execute(
+            """UPDATE procedures
+               SET trigger_context = ?, steps_md = ?, confidence = ?,
+                   source_memory_ids = ?, updated_at_epoch = ?, status = ?
+               WHERE id = ?""",
+            (trigger_context, steps_md, confidence, src_ids_json, now_epoch, status, proc_id),
+        )
+        # Sync FTS5: DELETE old row by rowid, then insert updated content
+        conn.execute("DELETE FROM procedures_fts WHERE rowid = ?", (proc_id,))
+        conn.execute(
+            "INSERT INTO procedures_fts(rowid, name, trigger_context, steps_md) VALUES (?, ?, ?, ?)",
+            (proc_id, name, trigger_context, steps_md),
+        )
+    else:
+        cursor = conn.execute(
+            """INSERT INTO procedures
+               (workspace_id, name, trigger_context, steps_md, confidence,
+                source_memory_ids, created_at_epoch, updated_at_epoch, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (workspace_id, name, trigger_context, steps_md, confidence,
+             src_ids_json, now_epoch, now_epoch, status),
+        )
+        proc_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO procedures_fts(rowid, name, trigger_context, steps_md) VALUES (?, ?, ?, ?)",
+            (proc_id, name, trigger_context, steps_md),
+        )
+
+    conn.commit()
+    return proc_id
+
+
+def search_procedures(
+    conn: sqlite3.Connection,
+    query: str,
+    workspace_id: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """FTS5 search across procedure name, trigger_context, and steps_md.
+
+    Deprecated procedures are always excluded.
+    Falls back to LIKE search if the FTS5 query is malformed.
+    """
+    try:
+        fts_query = query.replace('"', '""')
+        rows = conn.execute(
+            """SELECT p.* FROM procedures p
+               JOIN procedures_fts fts ON p.id = fts.rowid
+               WHERE procedures_fts MATCH ?
+               AND p.workspace_id = ?
+               AND p.status != 'deprecated'
+               ORDER BY rank, p.confidence DESC
+               LIMIT ?""",
+            (fts_query, workspace_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        like = f"%{query}%"
+        rows = conn.execute(
+            """SELECT * FROM procedures
+               WHERE workspace_id = ?
+               AND status != 'deprecated'
+               AND (name LIKE ? OR trigger_context LIKE ? OR steps_md LIKE ?)
+               ORDER BY confidence DESC
+               LIMIT ?""",
+            (workspace_id, like, like, like, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_applicable_procedures(
+    conn: sqlite3.Connection,
+    current_context: str,
+    workspace_id: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return the most applicable active procedures for the given context.
+
+    Uses FTS5 search then re-ranks by confidence (descending). Only active
+    procedures are returned (draft and deprecated are excluded).
+    """
+    candidates = search_procedures(conn, current_context, workspace_id, limit=limit * 3)
+    active = [r for r in candidates if r.get("status") == "active"]
+    active.sort(key=lambda r: r.get("confidence", 0.5), reverse=True)
+    return active[:limit]
+
+
+def list_procedures(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    status: str = "active",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List procedures for a workspace filtered by status, ordered by confidence desc."""
+    rows = conn.execute(
+        """SELECT * FROM procedures
+           WHERE workspace_id = ? AND status = ?
+           ORDER BY confidence DESC, updated_at_epoch DESC
+           LIMIT ?""",
+        (workspace_id, status, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
