@@ -1,7 +1,7 @@
 # Craft Memory System — Documentazione Architetturale Completa
 
-> **Data**: 2026-04-29  
-> **Versione**: 1.0 (HTTP transport, FastMCP 1.26.0)  
+> **Data**: 2026-04-30  
+> **Versione**: 2.0 (Phase 9 — 12 tools, decay, migration runner, privacy stripping)  
 > **Ambiente**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -116,49 +116,103 @@ else:
 ```
 **ATTENZIONE**: `http_app(stateless_http=True)` esisteva in versioni precedenti di FastMCP ma **non esiste più in 1.26.0**. L'API corretta è `streamable_http_app()`, combinata con `stateless_http=True` nel costruttore FastMCP.
 
-**Health check endpoint**:
+**Health check endpoint** (`/health`):
+- Verifica connessione DB con `SELECT 1`
+- Ritorna `db_size_mb` e `db_size_warning` (>100 MB)
+- `version` letta da `importlib.metadata` (non hardcoded — si aggiorna con release-please)
+
+**WAL checkpoint automatico**:
 ```python
-@mcp.custom_route("/health", methods=["GET"])
-async def health_check(request):
-    # Verifica connessione DB + ritorna stato JSON
+_write_count += 1
+if _write_count >= 100:
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+```
+Ogni 100 write per tenere il file WAL bounded senza bloccare i reader.
+
+**Auto-reconnect** su connessione stale:
+```python
+def _get_conn():
+    if _conn is not None:
+        try: _conn.execute("SELECT 1")
+        except: _conn = None
+    if _conn is None:
+        _conn = _db_get_connection(...)
+        _db_register_session(...)
 ```
 
-**7 tool esposti**:
+**Privacy stripping** prima di ogni `remember` e `update_memory`:
+```python
+_PRIVATE_PATTERNS = _re.compile(
+    r"<(private|system-reminder|system-instruction|system)>.*?</\1>",
+    _re.DOTALL | _re.IGNORECASE,
+)
+```
+
+**12 tool esposti**:
 
 | Tool | Scopo | Lettura/Scrittura |
 |------|-------|-------------------|
-| `remember` | Salva memoria episodica | Scrittura |
-| `search_memory` | Ricerca full-text | Lettura |
-| `get_recent_memory` | Recupera memorie recenti | Lettura |
-| `upsert_fact` | Salva/aggiorna fact stabile | Scrittura |
-| `list_open_loops` | Lista loop aperti | Lettura |
-| `close_open_loop` | Chiude un loop | Scrittura |
-| `summarize_scope` | Riepilogo completo | Lettura |
+| `remember` | Salva memoria episodica (con privacy stripping e tags) | Scrittura |
+| `update_memory` | Aggiorna content/category/importance di una memoria esistente | Scrittura |
+| `search_memory` | Ricerca FTS5 + BM25 hybrid ranking; LIKE fallback sicuro | Lettura |
+| `search_by_tag` | Filtra memorie per tag | Lettura |
+| `get_recent_memory` | Memorie ranked per importance decay; supporta token budget | Lettura |
+| `upsert_fact` | Salva/aggiorna fact stabile con confidence score | Scrittura |
+| `list_open_loops` | Lista loop aperti per priorità | Lettura |
+| `add_open_loop` | Crea nuovo loop cross-session | Scrittura |
+| `close_open_loop` | Chiude un loop con risoluzione opzionale | Scrittura |
+| `summarize_scope` | Snapshot completo: memorie (decay-ranked) + facts + loops | Lettura |
+| `save_summary` | Salva documento di handoff strutturato (decisions, facts, next_steps) | Scrittura |
+| `run_maintenance` | Cleanup old memories, trim summaries, dedup, VACUUM | Scrittura |
 
-### 3.2 File: `src/db.py` (527 righe)
+### 3.2 File: `src/db.py`
 
 Layer dati SQLite. Funzioni principali:
-- `get_connection(workspace_id)` → connessione con WAL mode, FK attive
-- `remember(...)` → INSERT con dedup via content_hash (ON CONFLICT DO NOTHING)
-- `search_memory(...)` → query FTS5 con `bm25()` ranking
-- `upsert_fact(...)` → INSERT OR REPLACE su UNIQUE(key, workspace_id, scope)
-- `summarize_scope(...)` → aggregazione memories + facts + loops + latest summary
-- `dedup_memories(...)` → pulizia memorie duplicate
-- `mark_stale_loops(...)` → segna loop > 30 giorni come stale
 
-### 3.3 File: `src/schema.sql`
+**Infrastruttura**:
+- `run_migrations(conn)` → applica `schema.sql` come v1 poi `migrations/NNN_*.sql` in ordine; usa tabella `schema_version` come tracker
+- `init_db(db_path)` → connessione WAL + esegue migrazioni; FK off durante migrazioni, on dopo
+- `_effective_importance(importance, created_at_epoch)` → `importance × e^(-λ × age_days)` con λ da `CRAFT_MEMORY_DECAY_LAMBDA` (default 0.005)
 
-5 tabelle + 1 FTS virtuale:
+**Memories**:
+- `remember(...)` → INSERT con dedup globale `UNIQUE(workspace_id, content_hash)` — un contenuto per workspace, indipendente dalla sessione; supporta `tags` (JSON array)
+- `search_memory(query, ...)` → FTS5 + BM25×0.7 + importance×0.3; fallback LIKE con parametri corretti (bug scope binding fixato)
+- `get_recent_memory(...)` → pool × 5, re-rank per decay; `max_tokens` tronca al budget
+- `update_memory(id, workspace_id, ...)` → aggiorna content/category/importance; ricalcola content_hash se content cambia
+- `search_by_tag(tag, ...)` → LIKE `%"tag"%` sul campo JSON tags
+
+**Facts / Open Loops**:
+- `upsert_fact(...)` → `ON CONFLICT DO UPDATE` su `UNIQUE(key, workspace_id, scope)`
+- `create_open_loop(...)` / `list_open_loops(...)` / `close_open_loop(...)`
+
+**Summaries**:
+- `save_summary(...)` → documento di handoff strutturato (decisions, facts_learned, open_loops, refs, next_steps)
+- `summarize_scope(...)` → usa decay ranking per recent memories (allineato a `get_recent_memory`)
+
+**Manutenzione**:
+- `daily_maintenance(...)` → `delete_old_memories` + `mark_stale_loops` + `trim_session_summaries` + `dedup_memories` + `VACUUM`
+- `trim_session_summaries(conn, workspace_id, keep_last=20)`
+
+### 3.3 File: `src/schema.sql` + `src/migrations/`
+
+Schema base (v1) + migrazioni versionate:
 
 | Tabella | Scopo |
 |---------|-------|
 | `sessions` | Tracking sessioni (craft_session_id, model, status) |
-| `memories` | Memorie episodiche con category, importance, scope, dedup hash |
-| `memories_fts` | Indice full-text FTS5 con porter stemmer + unicode61 |
-| `facts` | Knowledge stabile (UNIQUE key+workspace+scope) |
+| `memories` | Memorie episodiche con category, importance, scope, tags, dedup hash |
+| `memories_fts` | Indice FTS5 con porter stemmer + unicode61; category/scope UNINDEXED |
+| `facts` | Knowledge stabile (UNIQUE key+workspace+scope) con confidence score |
 | `open_loops` | Task incompleti con priorità e status |
-| `session_summaries` | Documenti di handoff tra sessioni |
-| `schema_version` | Versioning schema per migrazioni future |
+| `session_summaries` | Documenti di handoff strutturati tra sessioni |
+| `schema_version` | Tracker versioni per migration runner |
+
+**Migrazioni applicate**:
+- `001_global_dedup.sql` (se presente): cambia UNIQUE da `(session_id, content_hash)` a `(workspace_id, content_hash)`; ricrea FTS5 con category/scope UNINDEXED
+- `002_global_dedup.sql`: stessa logica (numerazione dipende da ordine applicazione)
+- `003_tags.sql`: aggiunge colonna `tags TEXT` a `memories` + index
+
+Il migration runner in `db.py:run_migrations()` controlla `MAX(version)` dalla tabella `schema_version` e applica solo le migrazioni pending.
 
 ### 3.4 File: `scripts/ensure-running.py`
 
@@ -208,17 +262,22 @@ python ensure-running.py --stop   # Stop processo sulla porta
 {
   "allowedMcpPatterns": [
     { "pattern": "remember", "comment": "Store episodic memories" },
+    { "pattern": "update_memory", "comment": "Update existing memory" },
     { "pattern": "search_memory", "comment": "Search memories via FTS5" },
-    { "pattern": "get_recent_memory", "comment": "Get recent memories" },
+    { "pattern": "search_by_tag", "comment": "Search memories by tag" },
+    { "pattern": "get_recent_memory", "comment": "Get recent memories (decay-ranked)" },
     { "pattern": "upsert_fact", "comment": "Store/update stable facts" },
     { "pattern": "list_open_loops", "comment": "List open loops" },
+    { "pattern": "add_open_loop", "comment": "Create new open loop" },
     { "pattern": "close_open_loop", "comment": "Close open loops" },
-    { "pattern": "summarize_scope", "comment": "Generate scope summary" }
+    { "pattern": "summarize_scope", "comment": "Generate scope summary" },
+    { "pattern": "save_summary", "comment": "Save structured session handoff" },
+    { "pattern": "run_maintenance", "comment": "Database maintenance" }
   ]
 }
 ```
 
-Questi pattern permettono a tutti i 7 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
+Questi pattern permettono a tutti i 12 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
 
 ### 4.3 Workspace: `config.json`
 
@@ -374,6 +433,16 @@ Tutti dichiarano `requiredSources: [memory]` nel frontmatter YAML.
 | **Problema** | Se il server HTTP non è avviato, l'automazione SessionStart fallisce silenziosamente. |
 | **Fix** | Aggiunto Step 1 in SessionStart e SchedulerTick: esegui `ensure-running.py` prima di qualsiasi tool call. |
 
+### 7.9 search_memory() scope binding errato nel LIKE fallback
+
+| | Dettaglio |
+|---|---|
+| **Problema** | Quando `scope` era impostato e la query FTS5 falliva (fallback LIKE), i risultati erano completamente sbagliati senza errori. |
+| **Root cause** | `params = [workspace_id, scope]` per il path FTS5. Nel fallback LIKE la query si aspetta `[workspace_id, like_pattern, like_pattern, scope]`, ma veniva passato `params + [like_pattern, like_pattern]` = `[workspace_id, scope, like_pattern, like_pattern]` → `scope` finiva nel placeholder di `content LIKE ?`. |
+| **Fix** | Costruire `like_params` separato: `[workspace_id, like_pattern, like_pattern]` + `scope` opzionale in coda. |
+| **File** | `src/craft_memory_mcp/db.py` funzione `search_memory()`. |
+| **Rilevato** | Phase 9 (2026-04-30) durante analisi critica pre-community proposal. |
+
 ### 7.8 remember() non salva nulla — violazione FK silenziosa
 
 | | Dettaglio |
@@ -412,8 +481,8 @@ pip install fastmcp uvicorn
 cd ~/craft-memory/src
 python server.py
 
-# Test HTTP
-CRAFT_MCP_TRANSPORT=http CRAFT_MCP_PORT=8392 python server.py
+# Test HTTP (default dal v2.0)
+CRAFT_MEMORY_TRANSPORT=http CRAFT_MEMORY_PORT=8392 python server.py
 # Verifica: curl http://localhost:8392/health
 ```
 
@@ -453,12 +522,17 @@ Crea `permissions.json`:
 {
   "allowedMcpPatterns": [
     { "pattern": "remember", "comment": "Store episodic memories" },
+    { "pattern": "update_memory", "comment": "Update existing memory" },
     { "pattern": "search_memory", "comment": "Search memories via FTS5" },
+    { "pattern": "search_by_tag", "comment": "Search memories by tag" },
     { "pattern": "get_recent_memory", "comment": "Get recent memories" },
     { "pattern": "upsert_fact", "comment": "Store/update stable facts" },
     { "pattern": "list_open_loops", "comment": "List open loops" },
+    { "pattern": "add_open_loop", "comment": "Create new open loop" },
     { "pattern": "close_open_loop", "comment": "Close open loops" },
-    { "pattern": "summarize_scope", "comment": "Generate scope summary" }
+    { "pattern": "summarize_scope", "comment": "Generate scope summary" },
+    { "pattern": "save_summary", "comment": "Save structured session handoff" },
+    { "pattern": "run_maintenance", "comment": "Database maintenance" }
   ]
 }
 ```
@@ -561,15 +635,17 @@ Questo è esattamente il modello usato dai source ufficiali (GitHub, Linear, Sla
 | Windows-only `.bat` | Solo `.bat` | Aggiungere `.sh` per macOS/Linux |
 | `pyproject.toml` | Dipendenze minime | Aggiungere `[project.scripts]` entry point |
 
-#### Valutazione di fattibilità
+#### Valutazione di fattibilità (aggiornata post-Phase 9)
 
 | Criterio | Voto | Note |
 |----------|------|------|
-| **Utilità per la community** | ⭐⭐⭐⭐⭐ | La memoria cross-sessione è una feature richiesta da molti utenti |
-| **Complessità di integrazione** | ⭐⭐⭐ | Richiede un MCP server esterno — non è "zero config" |
-| **Stabilità** | ⭐⭐⭐⭐ | HTTP + stateless + health check = robusto. Unico punto debole: il server deve essere avviato |
-| **Generalizzabilità** | ⭐⭐⭐⭐ | Il server MCP è generico. Le automazioni/skills sono portabili con piccoli adattamenti |
-| **Manutenibilità** | ⭐⭐⭐ | Dipende da FastMCP API (già cambiata una volta). Serve versioning |
+| **Utilità per la community** | ⭐⭐⭐⭐⭐ | Memoria cross-sessione richiesta da molti; tre-tier model unico nel panorama MCP |
+| **Complessità di integrazione** | ⭐⭐⭐ | Richiede MCP server esterno — non "zero config", ma `craft-memory install` automatizza tutto |
+| **Stabilità** | ⭐⭐⭐⭐⭐ | HTTP + stateless + health check + auto-reconnect + WAL checkpoint = produzione-ready |
+| **Differenziazione vs claude-mem** | ⭐⭐⭐⭐⭐ | Design opposto e complementare: esplicito vs passivo; decay + open loops + facts unici |
+| **Generalizzabilità** | ⭐⭐⭐⭐ | Server MCP generico; automazioni/skills portabili con piccoli adattamenti |
+| **Manutenibilità** | ⭐⭐⭐⭐ | Migration runner + release-please + CI tests; versioning semver automatico |
+| **Privacy/sicurezza** | ⭐⭐⭐⭐⭐ | Privacy stripping, nessuna dipendenza esterna, zero cloud, dati locali |
 
 ### 9.3 Raccomandazione
 
