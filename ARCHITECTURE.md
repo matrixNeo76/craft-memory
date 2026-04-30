@@ -1,7 +1,7 @@
 # Craft Memory System — Documentazione Architetturale Completa
 
 > **Data**: 2026-04-30  
-> **Versione**: 2.0 (Phase 9 — 12 tools, decay, migration runner, privacy stripping)  
+> **Versione**: 3.0 (Phase 10 — 17 tools, knowledge graph layer, confidence labels, god_facts, memory_diff)  
 > **Ambiente**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -148,7 +148,7 @@ _PRIVATE_PATTERNS = _re.compile(
 )
 ```
 
-**12 tool esposti**:
+**17 tool esposti**:
 
 | Tool | Scopo | Lettura/Scrittura |
 |------|-------|-------------------|
@@ -157,13 +157,18 @@ _PRIVATE_PATTERNS = _re.compile(
 | `search_memory` | Ricerca FTS5 + BM25 hybrid ranking; LIKE fallback sicuro | Lettura |
 | `search_by_tag` | Filtra memorie per tag | Lettura |
 | `get_recent_memory` | Memorie ranked per importance decay; supporta token budget | Lettura |
-| `upsert_fact` | Salva/aggiorna fact stabile con confidence score | Scrittura |
+| `upsert_fact` | Salva/aggiorna fact stabile con confidence score e `confidence_type` | Scrittura |
 | `list_open_loops` | Lista loop aperti per priorità | Lettura |
 | `add_open_loop` | Crea nuovo loop cross-session | Scrittura |
 | `close_open_loop` | Chiude un loop con risoluzione opzionale | Scrittura |
 | `summarize_scope` | Snapshot completo: memorie (decay-ranked) + facts + loops | Lettura |
 | `save_summary` | Salva documento di handoff strutturato (decisions, facts, next_steps) | Scrittura |
 | `run_maintenance` | Cleanup old memories, trim summaries, dedup, VACUUM | Scrittura |
+| `link_memories` | Crea arco diretto nel knowledge graph tra due memorie | Scrittura |
+| `get_relations` | Restituisce tutti i vicini (in/out/both) di una memoria nel grafo | Lettura |
+| `find_similar` | FTS5 BM25 similarity search; opzione `auto_link` per creare archi INFERRED | Lettura |
+| `god_facts` | Top N fact per impatto: `confidence × type_bonus × (1 + mention_count × 0.2)` | Lettura |
+| `memory_diff` | Delta dal timestamp epoch: nuove memorie, fact aggiornati, loop aperti/chiusi | Lettura |
 
 ### 3.2 File: `src/db.py`
 
@@ -182,8 +187,16 @@ Layer dati SQLite. Funzioni principali:
 - `search_by_tag(tag, ...)` → LIKE `%"tag"%` sul campo JSON tags
 
 **Facts / Open Loops**:
-- `upsert_fact(...)` → `ON CONFLICT DO UPDATE` su `UNIQUE(key, workspace_id, scope)`
+- `upsert_fact(...)` → `ON CONFLICT DO UPDATE` su `UNIQUE(key, workspace_id, scope)`; accetta `confidence_type: str = "extracted"` (`extracted | inferred | ambiguous`)
 - `create_open_loop(...)` / `list_open_loops(...)` / `close_open_loop(...)`
+
+**Knowledge Graph Layer** (Phase 10):
+- `_content_hash(content, kind)` → SHA256 full (non troncato) + kind namespace (`"\x00{kind}"`) per evitare collisioni cross-entità
+- `link_memories(conn, source_id, target_id, relation, workspace_id, confidence_type, confidence_score)` → inserisce arco diretto in `memory_relations`; `UNIQUE(source_id, target_id, relation)` per idempotenza; ritorna row id o None se duplicato/relazione invalida. Relazioni ammesse: `caused_by | contradicts | extends | implements | supersedes | semantically_similar_to`
+- `get_relations(conn, memory_id, workspace_id, direction="both")` → restituisce vicini con label direzione (`"in"` / `"out"`); JOIN con `memories` per content preview
+- `find_similar_memories(conn, memory_id, workspace_id, top_n=5, auto_link=False)` → estrae content della memoria, sanifica le parole (`re.sub(r"[^a-zA-Z0-9]", "", w)` per evitare errori FTS5 da trattini/punteggiatura), costruisce `"word1 OR word2 OR ..."`, esegue FTS5 BM25 search escludendo la memoria sorgente; se `auto_link=True` e BM25 score < -1.5, crea arco `semantically_similar_to` con `confidence_type="inferred"`
+- `god_facts(conn, workspace_id, top_n=10)` → score = `confidence × type_bonus × (1 + mention_count × 0.2)`; `type_bonus`: extracted=1.0, inferred=0.8, ambiguous=0.5; ordina DESC, ritorna con campo `god_score`
+- `memory_diff(conn, workspace_id, since_epoch)` → ritorna `{new_memories: [...], updated_facts: [...], opened_loops: [...], closed_loops: [...]}` comparando `created_at_epoch` / `updated_at` (come ISO string) rispetto all'epoch fornito
 
 **Summaries**:
 - `save_summary(...)` → documento di handoff strutturato (decisions, facts_learned, open_loops, refs, next_steps)
@@ -208,9 +221,23 @@ Schema base (v1) + migrazioni versionate:
 | `schema_version` | Tracker versioni per migration runner |
 
 **Migrazioni applicate**:
-- `001_global_dedup.sql` (se presente): cambia UNIQUE da `(session_id, content_hash)` a `(workspace_id, content_hash)`; ricrea FTS5 con category/scope UNINDEXED
+- `001_global_dedup.sql`: cambia UNIQUE da `(session_id, content_hash)` a `(workspace_id, content_hash)`; ricrea FTS5 con category/scope UNINDEXED
 - `002_global_dedup.sql`: stessa logica (numerazione dipende da ordine applicazione)
 - `003_tags.sql`: aggiunge colonna `tags TEXT` a `memories` + index
+- `004_relations.sql`: aggiunge `confidence_type TEXT DEFAULT 'extracted' CHECK(...)` a `facts`; crea tabella `memory_relations` con 5 indici (source_id, target_id, workspace_id, confidence_type, relation); FK CASCADE su `memories(id)`
+
+**Tabella `memory_relations`** (introdotta in v3.0):
+
+| Colonna | Tipo | Note |
+|---------|------|------|
+| `id` | INTEGER PK | Autoincrement |
+| `source_id` | INTEGER FK | → `memories(id)` CASCADE DELETE |
+| `target_id` | INTEGER FK | → `memories(id)` CASCADE DELETE |
+| `relation` | TEXT | `caused_by | contradicts | extends | implements | supersedes | semantically_similar_to` |
+| `confidence_type` | TEXT | `extracted | inferred | ambiguous` |
+| `confidence_score` | REAL | 0.0–1.0 |
+| `workspace_id` | TEXT | Isolamento per workspace |
+| `created_at_epoch` | INTEGER | Unix timestamp creazione |
 
 Il migration runner in `db.py:run_migrations()` controlla `MAX(version)` dalla tabella `schema_version` e applica solo le migrazioni pending.
 
@@ -272,12 +299,17 @@ python ensure-running.py --stop   # Stop processo sulla porta
     { "pattern": "close_open_loop", "comment": "Close open loops" },
     { "pattern": "summarize_scope", "comment": "Generate scope summary" },
     { "pattern": "save_summary", "comment": "Save structured session handoff" },
-    { "pattern": "run_maintenance", "comment": "Database maintenance" }
+    { "pattern": "run_maintenance", "comment": "Database maintenance" },
+    { "pattern": "link_memories", "comment": "Create knowledge graph edge" },
+    { "pattern": "get_relations", "comment": "Get graph neighbors of a memory" },
+    { "pattern": "find_similar", "comment": "FTS5 BM25 similarity search" },
+    { "pattern": "god_facts", "comment": "Top facts by impact score" },
+    { "pattern": "memory_diff", "comment": "Delta since epoch timestamp" }
   ]
 }
 ```
 
-Questi pattern permettono a tutti i 12 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
+Questi pattern permettono a tutti i 17 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
 
 ### 4.3 Workspace: `config.json`
 

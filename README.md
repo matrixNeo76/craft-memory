@@ -103,6 +103,11 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 | **Migration runner** | Versioned SQL migrations applied automatically on startup |
 | **4 automations** | SessionStart, SessionEnd, SchedulerTick, LabelAdd — all pre-configured |
 | **4 skills** | memory-protocol, memory-start, memory-maintenance, session-handoff |
+| **Knowledge graph** | Directed edges between memories (`link_memories`) with typed relations: caused_by, contradicts, extends, implements, supersedes, semantically_similar_to |
+| **Confidence labels** | Facts and graph edges carry `confidence_type`: `extracted` (observed directly), `inferred` (derived), `ambiguous` (uncertain) |
+| **god_facts** | Top N most impactful facts ranked by `confidence × type_bonus × (1 + mention_count × 0.2)` — the most load-bearing knowledge at a glance |
+| **memory_diff** | Delta since a Unix timestamp: new memories, updated facts, opened/closed loops — ideal for session catch-up |
+| **Semantic similarity** | `find_similar` uses FTS5 BM25 to find related memories; `auto_link=True` auto-creates INFERRED graph edges |
 | **Local-first** | All data stays on your machine, no cloud sync, zero external dependencies |
 
 ---
@@ -123,6 +128,11 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 | `summarize_scope(scope)` | Generate a full snapshot: memories + facts + loops + latest summary |
 | `save_summary(summary, decisions, facts_learned, open_loops, refs, next_steps)` | Save a structured session handoff document |
 | `run_maintenance()` | Cleanup old memories, trim summaries, dedup, VACUUM |
+| `link_memories(source_id, target_id, relation, confidence_type, confidence_score)` | Create a directed edge between two memories in the knowledge graph |
+| `get_relations(memory_id, direction)` | Get graph neighbors of a memory (`in`, `out`, or `both`) |
+| `find_similar(memory_id, top_n, auto_link)` | Find semantically similar memories via FTS5 BM25; optionally auto-links results as INFERRED edges |
+| `god_facts(top_n)` | Return the N most impactful facts with `god_score`, `mention_count`, `confidence_type` |
+| `memory_diff(since_epoch)` | Return changes since a Unix timestamp: new memories, updated facts, new/closed loops |
 
 ---
 
@@ -209,8 +219,12 @@ craft-memory/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
 │   │   ├── server.py        # FastMCP server, 12 tools, health check
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
-│   │   ├── schema.sql       # 5 tables + FTS virtual table + triggers
+│   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
+│   │   │   ├── 001_global_dedup.sql
+│   │   │   ├── 002_global_dedup.sql
+│   │   │   ├── 003_tags.sql
+│   │   │   └── 004_relations.sql  # knowledge graph: memory_relations + confidence_type
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -223,7 +237,7 @@ craft-memory/
 │   └── session-handoff/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
-├── tests/                   # pytest suite
+├── tests/                   # pytest suite (42 tests: core + graph layer)
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```
