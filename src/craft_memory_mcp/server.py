@@ -673,6 +673,8 @@ def link_memories(
     relation: str,
     confidence_type: str = "extracted",
     confidence_score: float = 1.0,
+    role: str = "context",
+    weight: float = 1.0,
 ) -> str:
     """Create a directed relation between two memories (knowledge graph edge).
 
@@ -682,6 +684,8 @@ def link_memories(
         relation: caused_by | contradicts | extends | implements | supersedes | semantically_similar_to
         confidence_type: extracted (you observed it) | inferred (reasoned) | ambiguous (uncertain)
         confidence_score: Strength of the relation 0.0-1.0 (default: 1.0)
+        role: core | context | detail | temporal | causal (semantic role, default: context)
+        weight: Importance of this edge in the graph 0.0-1.0 (default: 1.0)
 
     Returns:
         Confirmation or duplicate notice
@@ -690,11 +694,12 @@ def link_memories(
     rel_id = _db_link_memories(
         conn, source_id, target_id, relation,
         WORKSPACE_ID, confidence_type, confidence_score,
+        role=role, weight=weight,
     )
     if rel_id is None:
         return f"Relation already exists or invalid: #{source_id} --{relation}--> #{target_id}"
     _maybe_checkpoint(conn)
-    return f"Relation #{rel_id} created: #{source_id} --{relation} [{confidence_type}]--> #{target_id}"
+    return f"Relation #{rel_id} created: #{source_id} --[{role}:{relation} w={weight}]--> #{target_id}"
 
 
 # ─── Tool: get_relations ────────────────────────────────────────────

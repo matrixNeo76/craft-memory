@@ -7,6 +7,7 @@ from constants import TEST_SESSION_ID, TEST_WORKSPACE_ID
 from craft_memory_mcp.db import (
     find_similar_memories,
     get_relations,
+    get_relations_by_role,
     god_facts,
     link_memories,
     memory_diff,
@@ -223,3 +224,61 @@ def test_memory_diff_summary_string(registered_conn):
     _mem(registered_conn, "Something changed")
     diff = memory_diff(registered_conn, TEST_WORKSPACE_ID, before)
     assert "new memories" in diff["summary"]
+
+
+# ─── Hyperedge Roles (μ3) ────────────────────────────────────────────
+
+
+def test_link_memories_with_role_and_weight(registered_conn):
+    """link_memories accepts role and weight and stores them."""
+    a = _mem(registered_conn, "Decision: use SQLite WAL mode", "decision")
+    b = _mem(registered_conn, "WAL mode prevents write contention", "discovery")
+    rel_id = link_memories(registered_conn, a, b, "caused_by", TEST_WORKSPACE_ID,
+                           role="causal", weight=0.9)
+    assert rel_id is not None
+    row = registered_conn.execute(
+        "SELECT role, weight FROM memory_relations WHERE id = ?", (rel_id,)
+    ).fetchone()
+    assert row["role"] == "causal"
+    assert abs(row["weight"] - 0.9) < 0.001
+
+
+def test_link_memories_invalid_role_rejected(registered_conn):
+    """link_memories rejects unknown role values."""
+    a = _mem(registered_conn, "Memory A", "note")
+    b = _mem(registered_conn, "Memory B", "note")
+    rel_id = link_memories(registered_conn, a, b, "extends", TEST_WORKSPACE_ID,
+                           role="unknown_role")
+    assert rel_id is None
+
+
+def test_get_relations_by_role_filters_correctly(registered_conn):
+    """get_relations_by_role returns only edges with the specified role."""
+    a = _mem(registered_conn, "Core decision", "decision")
+    b = _mem(registered_conn, "Supporting detail", "note")
+    c = _mem(registered_conn, "Temporal context", "note")
+    link_memories(registered_conn, a, b, "extends", TEST_WORKSPACE_ID, role="detail")
+    link_memories(registered_conn, a, c, "extends", TEST_WORKSPACE_ID, role="temporal")
+
+    detail_rels = get_relations_by_role(registered_conn, a, TEST_WORKSPACE_ID, role="detail")
+    temporal_rels = get_relations_by_role(registered_conn, a, TEST_WORKSPACE_ID, role="temporal")
+
+    assert len(detail_rels) == 1
+    assert detail_rels[0]["role"] == "detail"
+    assert len(temporal_rels) == 1
+    assert temporal_rels[0]["role"] == "temporal"
+
+
+def test_get_relations_by_role_ordered_by_weight(registered_conn):
+    """get_relations_by_role returns edges ordered by weight descending."""
+    a = _mem(registered_conn, "Source memory", "note")
+    b = _mem(registered_conn, "Low weight target", "note")
+    c = _mem(registered_conn, "High weight target", "note")
+    link_memories(registered_conn, a, b, "semantically_similar_to", TEST_WORKSPACE_ID,
+                  role="context", weight=0.3)
+    link_memories(registered_conn, a, c, "semantically_similar_to", TEST_WORKSPACE_ID,
+                  role="context", weight=0.9)
+
+    rels = get_relations_by_role(registered_conn, a, TEST_WORKSPACE_ID, role="context")
+    assert len(rels) == 2
+    assert rels[0]["weight"] >= rels[1]["weight"]

@@ -899,23 +899,26 @@ def link_memories(
     workspace_id: str,
     confidence_type: str = "extracted",
     confidence_score: float = 1.0,
+    role: str = "context",
+    weight: float = 1.0,
 ) -> int | None:
     """Create a directed relation between two memories. Returns row id or None if duplicate/invalid."""
     valid_relations = {
         "caused_by", "contradicts", "extends",
         "implements", "supersedes", "semantically_similar_to",
     }
-    if relation not in valid_relations:
+    valid_roles = {"core", "context", "detail", "temporal", "causal"}
+    if relation not in valid_relations or role not in valid_roles:
         return None
     now_epoch = _now_epoch()
     try:
         cursor = conn.execute(
             """INSERT OR IGNORE INTO memory_relations
                (source_id, target_id, relation, confidence_type, confidence_score,
-                workspace_id, created_at_epoch)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                workspace_id, created_at_epoch, role, weight)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (source_id, target_id, relation, confidence_type,
-             confidence_score, workspace_id, now_epoch),
+             confidence_score, workspace_id, now_epoch, role, weight),
         )
         conn.commit()
         return cursor.lastrowid if cursor.rowcount > 0 else None
@@ -950,6 +953,34 @@ def get_relations(
                FROM memory_relations mr JOIN memories m ON mr.source_id = m.id
                WHERE mr.target_id = ? AND mr.workspace_id = ?""",
             (memory_id, workspace_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_relations_by_role(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    role: str,
+    direction: str = "both",
+) -> list[dict[str, Any]]:
+    """Get graph neighbors filtered by semantic role. Ordered by weight DESC."""
+    rows: list[Any] = []
+    if direction in ("out", "both"):
+        rows += conn.execute(
+            """SELECT mr.*, m.content AS other_content, 'out' AS direction
+               FROM memory_relations mr JOIN memories m ON mr.target_id = m.id
+               WHERE mr.source_id = ? AND mr.workspace_id = ? AND mr.role = ?
+               ORDER BY mr.weight DESC""",
+            (memory_id, workspace_id, role),
+        ).fetchall()
+    if direction in ("in", "both"):
+        rows += conn.execute(
+            """SELECT mr.*, m.content AS other_content, 'in' AS direction
+               FROM memory_relations mr JOIN memories m ON mr.source_id = m.id
+               WHERE mr.target_id = ? AND mr.workspace_id = ? AND mr.role = ?
+               ORDER BY mr.weight DESC""",
+            (memory_id, workspace_id, role),
         ).fetchall()
     return [dict(r) for r in rows]
 
