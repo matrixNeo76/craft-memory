@@ -8,6 +8,7 @@ Environment variables:
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -37,20 +38,63 @@ def _db_path(workspace_id: str) -> Path:
     return base / f"{workspace_id}.db"
 
 
+_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_DECAY_LAMBDA = float(os.environ.get("CRAFT_MEMORY_DECAY_LAMBDA", "0.005"))
+
+
+def _effective_importance(importance: int, created_at_epoch: int) -> float:
+    """Time-decayed importance score. Older memories score progressively lower."""
+    age_days = (_now_epoch() - created_at_epoch) / 86400
+    return importance * math.exp(-_DECAY_LAMBDA * age_days)
+
+
+def run_migrations(conn: sqlite3.Connection) -> None:
+    """Apply pending schema migrations in version order."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+    current = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version"
+    ).fetchone()[0]
+
+    if current < 1:
+        schema_path = Path(__file__).parent / "schema.sql"
+        if not schema_path.exists():
+            raise FileNotFoundError(f"Schema not found at {schema_path}")
+        conn.executescript(schema_path.read_text(encoding="utf-8"))
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (1, datetime('now'))")
+        conn.commit()
+        current = 1
+
+    if _MIGRATIONS_DIR.exists():
+        for mf in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+            try:
+                version = int(mf.stem.split("_")[0])
+            except (ValueError, IndexError):
+                continue
+            if version > current:
+                conn.executescript(mf.read_text(encoding="utf-8"))
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version VALUES (?, datetime('now'))",
+                    (version,),
+                )
+                conn.commit()
+                current = version
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
-    """Initialize database with schema. Returns connection."""
+    """Initialize database and run pending migrations. Returns connection."""
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    run_migrations(conn)
     conn.execute("PRAGMA foreign_keys=ON")
-
-    schema_path = Path(__file__).parent / "schema.sql"
-    if schema_path.exists():
-        conn.executescript(schema_path.read_text(encoding="utf-8"))
-    else:
-        raise FileNotFoundError(f"Schema not found at {schema_path}")
-
-    conn.commit()
     return conn
 
 
@@ -113,24 +157,26 @@ def remember(
     importance: int = 5,
     scope: str = "workspace",
     source_session: str | None = None,
+    tags: list[str] | None = None,
 ) -> int | None:
     """Store a new episodic memory. Returns row id or None if duplicate."""
     c_hash = _content_hash(content)
     now_iso = _now_iso()
     now_epoch = _now_epoch()
+    tags_json = json.dumps(tags) if tags else None
     try:
         cursor = conn.execute(
             """INSERT INTO memories
                (session_id, workspace_id, content, category, importance,
-                scope, source_session, content_hash, created_at, created_at_epoch)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                scope, source_session, content_hash, created_at, created_at_epoch, tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, workspace_id, content, category, importance,
-             scope, source_session, c_hash, now_iso, now_epoch),
+             scope, source_session, c_hash, now_iso, now_epoch, tags_json),
         )
         conn.commit()
         return cursor.lastrowid
     except sqlite3.IntegrityError:
-        # Duplicate (session_id, content_hash) - silently skip
+        # Duplicate (workspace_id, content_hash) - silently skip
         return None
 
 
@@ -147,7 +193,7 @@ def search_memory(
     if scope:
         params.append(scope)
 
-    # Try FTS5 first
+    # Try FTS5 first with bm25 + importance hybrid ranking
     try:
         fts_query = query.replace('"', '""')  # Escape double quotes
         rows = conn.execute(
@@ -156,7 +202,7 @@ def search_memory(
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
                 {scope_filter}
-                ORDER BY m.importance DESC, m.created_at_epoch DESC
+                ORDER BY (bm25(memories_fts) * -1.0 * 0.7) + (m.importance * 0.3) DESC
                 LIMIT ?""",
             [fts_query] + params + [limit],
         ).fetchall()
@@ -185,21 +231,29 @@ def get_recent_memory(
     scope: str | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Get most recent memories, ordered by creation time."""
+    """Get most relevant memories, ranked by importance with time decay."""
     scope_filter = "AND scope = ?" if scope else ""
     params: list[Any] = [workspace_id]
     if scope:
         params.append(scope)
 
+    # Fetch a larger pool and re-rank by effective (decayed) importance
+    fetch_limit = max(limit * 5, 50)
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
             {scope_filter}
             ORDER BY created_at_epoch DESC
             LIMIT ?""",
-        params + [limit],
+        params + [fetch_limit],
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    scored = sorted(
+        [dict(r) for r in rows],
+        key=lambda m: _effective_importance(m["importance"], m["created_at_epoch"]),
+        reverse=True,
+    )
+    return scored[:limit]
 
 
 # ─── Facts CRUD ──────────────────────────────────────────────────────
@@ -529,3 +583,67 @@ def dedup_memories(
     )
     conn.commit()
     return cursor.rowcount
+
+
+def trim_session_summaries(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    keep_last: int = 20,
+) -> int:
+    """Delete old session summaries keeping only the most recent N. Returns count deleted."""
+    cursor = conn.execute(
+        """DELETE FROM session_summaries
+           WHERE workspace_id = ? AND id NOT IN (
+             SELECT id FROM session_summaries
+             WHERE workspace_id = ?
+             ORDER BY created_at_epoch DESC
+             LIMIT ?
+           )""",
+        (workspace_id, workspace_id, keep_last),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def daily_maintenance(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Run all maintenance: cleanup, dedup, trim summaries, VACUUM. Returns stats."""
+    deleted_mem = delete_old_memories(conn, workspace_id, days=180, min_importance=3)
+    stale_loops = mark_stale_loops(conn, workspace_id, days=30)
+    trimmed = trim_session_summaries(conn, workspace_id, keep_last=20)
+    deduped = dedup_memories(conn, workspace_id)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.executescript("VACUUM;")
+    return {
+        "deleted_memories": deleted_mem,
+        "stale_loops": stale_loops,
+        "trimmed_summaries": trimmed,
+        "deduped_memories": deduped,
+    }
+
+
+def search_by_tag(
+    conn: sqlite3.Connection,
+    tag: str,
+    workspace_id: str,
+    scope: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search memories by tag. Returns memories that have the given tag."""
+    scope_filter = "AND scope = ?" if scope else ""
+    params: list[Any] = [workspace_id, f'%"{tag}"%']
+    if scope:
+        params.append(scope)
+
+    rows = conn.execute(
+        f"""SELECT * FROM memories
+            WHERE workspace_id = ?
+            AND tags LIKE ?
+            {scope_filter}
+            ORDER BY importance DESC, created_at_epoch DESC
+            LIMIT ?""",
+        params + [limit],
+    ).fetchall()
+    return [dict(r) for r in rows]

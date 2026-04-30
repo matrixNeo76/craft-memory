@@ -103,7 +103,7 @@ def test_remember_dedup_same_session(registered_conn):
 
 
 def test_remember_different_sessions_same_content(db_conn):
-    """Two different sessions can store the same content — dedup is per session."""
+    """Global dedup: same content in two sessions stores only the first occurrence."""
     session_a = "session-a"
     session_b = "session-b"
     register_session(db_conn, session_a, TEST_WORKSPACE_ID)
@@ -115,11 +115,10 @@ def test_remember_different_sessions_same_content(db_conn):
     id_b = remember(db_conn, session_b, TEST_WORKSPACE_ID, content, category="discovery")
 
     assert id_a is not None
-    assert id_b is not None
-    assert id_a != id_b
+    assert id_b is None  # global dedup: second session gets duplicate skipped
 
     count = db_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-    assert count == 2
+    assert count == 1
 
 
 def test_search_memory_fts5(registered_conn):

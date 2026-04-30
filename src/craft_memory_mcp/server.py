@@ -41,6 +41,7 @@ from craft_memory_mcp.db import (
     close_open_loop as _db_close_open_loop,
     complete_session as _db_complete_session,
     create_open_loop as _db_create_open_loop,
+    daily_maintenance as _db_daily_maintenance,
     dedup_memories as _db_dedup_memories,
     delete_old_memories as _db_delete_old_memories,
     get_connection as _db_get_connection,
@@ -52,6 +53,7 @@ from craft_memory_mcp.db import (
     remember as _db_remember,
     register_session as _db_register_session,
     save_summary as _db_save_summary,
+    search_by_tag as _db_search_by_tag,
     search_facts as _db_search_facts,
     search_memory as _db_search_memory,
     summarize_scope as _db_summarize_scope,
@@ -101,14 +103,19 @@ IMPORTANT: Only store what has real value. Avoid noise and trivial entries.""",
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Health check endpoint for monitoring and keep-alive probes."""
+    import os as _os
+    from pathlib import Path as _Path
     from starlette.responses import JSONResponse
     try:
         conn = _get_conn()
-        # Quick DB liveness check
         conn.execute("SELECT 1")
         db_status = "healthy"
     except Exception as e:
         db_status = f"error: {e}"
+
+    db_dir = _Path(_os.environ.get("CRAFT_MEMORY_DB_DIR", str(_Path.home() / ".craft-agent/memory")))
+    db_path = db_dir / f"{WORKSPACE_ID}.db"
+    db_size_mb = round(db_path.stat().st_size / 1024 / 1024, 2) if db_path.exists() else 0
 
     return JSONResponse({
         "status": "healthy" if db_status == "healthy" else "degraded",
@@ -117,18 +124,37 @@ async def health_check(request):
         "workspace": WORKSPACE_ID,
         "transport": MCP_TRANSPORT,
         "db": db_status,
+        "db_size_mb": db_size_mb,
+        "db_size_warning": db_size_mb > 100,
     })
 
 
 # Global connection (one per server instance)
 _conn = None
 
+# WAL checkpoint counter — flush WAL every N writes to keep file size bounded
+_write_count = 0
+_CHECKPOINT_EVERY = 100
+
+
+def _maybe_checkpoint(conn) -> None:
+    global _write_count
+    _write_count += 1
+    if _write_count >= _CHECKPOINT_EVERY:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        _write_count = 0
+
 
 def _get_conn():
     global _conn
+    # Ping to detect stale/corrupted connection and reset if needed
+    if _conn is not None:
+        try:
+            _conn.execute("SELECT 1")
+        except Exception:
+            _conn = None
     if _conn is None:
         _conn = _db_get_connection(WORKSPACE_ID)
-        # Fix #8: sessions table must have a row before any memory INSERT (FK constraint)
         _db_register_session(_conn, CRAFT_SESSION_ID, WORKSPACE_ID)
     return _conn
 
@@ -142,6 +168,7 @@ def remember(
     scope: str = "workspace",
     importance: int = 5,
     source_session: str | None = None,
+    tags: list[str] | None = None,
 ) -> str:
     """Store a new episodic memory (decision, discovery, bugfix, feature, refactor, change, note).
 
@@ -151,6 +178,7 @@ def remember(
         scope: Memory scope (default: workspace)
         importance: Priority 1-10 (default: 5)
         source_session: Session ID that created this memory
+        tags: Optional list of tags e.g. ["auth", "deploy"]
 
     Returns:
         Confirmation with memory ID or duplicate notice
@@ -159,11 +187,13 @@ def remember(
     session_id = source_session or CRAFT_SESSION_ID
     mem_id = _db_remember(
         conn, session_id, WORKSPACE_ID, content,
-        category, importance, scope, session_id,
+        category, importance, scope, session_id, tags,
     )
     if mem_id is None:
-        return f"Duplicate memory skipped (same content already stored in this session)"
-    return f"Memory #{mem_id} stored: [{category}] (importance={importance})"
+        return "Duplicate memory skipped (same content already stored in this workspace)"
+    tag_str = f" tags={tags}" if tags else ""
+    _maybe_checkpoint(conn)
+    return f"Memory #{mem_id} stored: [{category}] (importance={importance}){tag_str}"
 
 
 # ─── Tool: search_memory ─────────────────────────────────────────────
@@ -254,12 +284,8 @@ def upsert_fact(
     fact_id = _db_upsert_fact(
         conn, key, value, WORKSPACE_ID, scope, confidence, CRAFT_SESSION_ID,
     )
-
-    # Also show current facts for context
-    all_facts = _db_get_facts(conn, WORKSPACE_ID, scope if scope != "workspace" else None)
-    fact_lines = [f"  {f['key']}: {f['value']} (confidence={f['confidence']})" for f in all_facts]
-
-    return f"Fact #{fact_id} upserted: {key} = {value}\n\nCurrent facts:\n" + "\n".join(fact_lines)
+    _maybe_checkpoint(conn)
+    return f"Fact #{fact_id} upserted: {key} = {value[:100]}"
 
 
 # ─── Tool: list_open_loops ───────────────────────────────────────────
@@ -312,6 +338,34 @@ def close_open_loop(
     if success:
         return f"Loop #{id} closed." + (f" Resolution: {resolution}" if resolution else "")
     return f"Loop #{id} not found or already closed."
+
+
+# ─── Tool: add_open_loop ────────────────────────────────────────────
+
+@mcp.tool()
+def add_open_loop(
+    title: str,
+    description: str | None = None,
+    priority: str = "medium",
+    scope: str = "workspace",
+) -> str:
+    """Create a new open loop (incomplete task or follow-up to track across sessions).
+
+    Args:
+        title: Short title for the loop
+        description: Detailed description (optional)
+        priority: low | medium | high | critical (default: medium)
+        scope: Memory scope (default: workspace)
+
+    Returns:
+        Confirmation with loop ID
+    """
+    conn = _get_conn()
+    loop_id = _db_create_open_loop(
+        conn, CRAFT_SESSION_ID, WORKSPACE_ID,
+        title, description, priority, scope, CRAFT_SESSION_ID,
+    )
+    return f"Open loop #{loop_id} created: [{priority}] {title}"
 
 
 # ─── Tool: summarize_scope ───────────────────────────────────────────
@@ -367,6 +421,69 @@ def summarize_scope(
             )
 
     return "\n".join(lines)
+
+
+# ─── Tool: run_maintenance ──────────────────────────────────────────
+
+@mcp.tool()
+def run_maintenance() -> str:
+    """Run database maintenance: cleanup old memories, trim session summaries, VACUUM.
+
+    Deletes memories older than 180 days with importance < 3, marks stale loops,
+    keeps only the 20 most recent session summaries, deduplicates, and runs VACUUM.
+
+    Returns:
+        Maintenance stats (deleted memories, stale loops, trimmed summaries, deduped)
+    """
+    conn = _get_conn()
+    result = _db_daily_maintenance(conn, WORKSPACE_ID)
+    return (
+        f"Maintenance complete: "
+        f"deleted_memories={result['deleted_memories']}, "
+        f"stale_loops={result['stale_loops']}, "
+        f"trimmed_summaries={result['trimmed_summaries']}, "
+        f"deduped_memories={result['deduped_memories']}"
+    )
+
+
+# ─── Tool: search_by_tag ────────────────────────────────────────────
+
+@mcp.tool()
+def search_by_tag(
+    tag: str,
+    scope: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Search memories by tag.
+
+    Args:
+        tag: Tag to search for (e.g. "auth", "deploy")
+        scope: Filter by scope (default: all)
+        limit: Max results (default: 20)
+
+    Returns:
+        List of memories with the given tag
+    """
+    conn = _get_conn()
+    results = _db_search_by_tag(conn, tag, WORKSPACE_ID, scope, limit)
+    if not results:
+        return f"No memories found with tag '{tag}'."
+
+    lines = [f"Memories tagged '{tag}' ({len(results)}):\n"]
+    for r in results:
+        import json as _json
+        tags_str = ""
+        if r.get("tags"):
+            try:
+                tags_str = f" tags={_json.loads(r['tags'])}"
+            except Exception:
+                pass
+        lines.append(
+            f"#{r['id']} [{r['category']}] importance={r['importance']}"
+            f"{tags_str} ({r['created_at'][:10]})\n"
+            f"  {r['content'][:200]}"
+        )
+    return "\n\n".join(lines)
 
 
 # ─── Entry Point (called by CLI or directly) ─────────────────────────
