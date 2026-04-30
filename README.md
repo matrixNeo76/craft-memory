@@ -63,7 +63,7 @@ During work    → remember (decisions) + upsert_fact (stable knowledge)
 Search         → search_memory
 ```
 
-Everything else — graph relationships, maintenance, diagnostics — is available but optional. Tools are grouped into **core**, **graph**, and **admin** in the [guide](sources/memory/guide.md) and docstrings.
+Everything else — graph relationships, procedure tracking, multi-hop context, batch ops — is available but optional. Tools are grouped into **core**, **graph**, **procedures**, **facts**, **batch**, and **admin** in the [guide](sources/memory/guide.md) and docstrings.
 
 ---
 
@@ -132,6 +132,11 @@ Everything else — graph relationships, maintenance, diagnostics — is availab
 | **Procedural memory** | `procedures` table with `UNIQUE(workspace_id, name)` upsert; FTS5 porter index; trigger context + markdown steps + confidence; `save_procedure`, `search_procedures`, `get_applicable_procedures` |
 | **Scope hierarchy** | `scope_hierarchy` table: `session < project < workspace < user < global`; `get_scope_ancestors()` traverses the chain for coarse-to-fine fallback |
 | **Coarse-to-fine retrieval** | 3-layer pattern: Layer 1 = `search_memory` (FTS5 snippets), Layer 2 = `get_recent_memory` + `get_relations` (context), Layer 3 = `get_memory_bundle` (full batch fetch by IDs) |
+| **Exposed utility tools** | `search_facts` (keyword search on key/value), `list_procedures` (by status), `get_scope_ancestors` (chain from specific to broad), `consolidation_candidates` (pruning candidates) — previously internal, now full MCP tools |
+| **Procedure outcome tracking** | `record_procedure_outcome` saves success/partial/failure results per procedure; `get_procedure_outcomes` returns history newest-first |
+| **Bayesian confidence evolution** | `daily_maintenance` updates procedure confidence via `new = clamp(old×0.3 + avg_score×0.7, 0.05, 0.95)` using the last N outcomes; outcome scores: success=1.0, partial=0.5, failure=0.0 |
+| **Multi-hop graph context** | `get_graph_context` BFS traversal up to N hops: returns center memory + all reachable nodes/edges + `depth_map`; inbound + outbound traversal, cycle-safe via visited set |
+| **Batch memory save** | `batch_remember` saves N memories in one MCP call (JSON array input); duplicates return `None` in that slot without error; reduces round-trips in session-end automations |
 
 ---
 
@@ -176,6 +181,17 @@ Everything else — graph relationships, maintenance, diagnostics — is availab
 | `get_applicable_procedures(current_context, limit)` | Find the most relevant procedures for the current task |
 | **— Sprint 5: Scope Hierarchy + Retrieval —** | |
 | `get_memory_bundle(memory_ids)` | Batch-fetch N complete memories by ID list. Layer 3 of coarse-to-fine retrieval. |
+| **— Sprint 5-Close: Expose Utility Tools —** | |
+| `search_facts(query, scope, limit)` | Keyword search on facts key or value; scope-filterable; ordered by confidence desc |
+| `list_procedures(status, limit)` | List all procedures in workspace filtered by status (`active`/`draft`/`deprecated`) |
+| `get_scope_ancestors(scope)` | Return scope + full ancestor chain from specific to broad (session → global) |
+| `consolidation_candidates(importance_threshold, age_days, limit)` | Find old non-core memories with low effective importance ready for pruning |
+| **— Sprint 6: Procedure Outcome Tracking —** | |
+| `record_procedure_outcome(procedure_id, outcome, notes)` | Record execution result (`success`/`partial`/`failure`) for a procedure; triggers confidence evolution |
+| `get_procedure_outcomes(procedure_id, limit)` | Return recent execution outcomes for a procedure, newest first |
+| **— Sprint 7: Graph Context + Batch Ops —** | |
+| `get_graph_context(memory_id, depth)` | BFS multi-hop traversal: return center memory + neighbors up to N hops with edges and `depth_map` |
+| `batch_remember(entries_json)` | Save N memories in one call (JSON array); duplicates return `None` without error; reduces round-trips |
 
 ---
 
@@ -260,7 +276,7 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 33 tools, health check
+│   │   ├── server.py        # FastMCP server, 41 tools, health check
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
 │   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
@@ -272,7 +288,8 @@ craft-memory/
 │   │   │   ├── 007_edge_manual_flag.sql
 │   │   │   ├── 008_fact_temporal.sql   # lifecycle status + temporal fields
 │   │   │   ├── 009_procedures.sql      # procedural memory + FTS5 index
-│   │   │   └── 010_scope_hierarchy.sql # scope hierarchy (session→global)
+│   │   │   ├── 010_scope_hierarchy.sql # scope hierarchy (session→global)
+│   │   │   └── 011_procedure_outcomes.sql # procedure execution outcomes + confidence evolution
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -285,7 +302,7 @@ craft-memory/
 │   └── session-handoff/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
-├── tests/                   # pytest suite (127 tests: core, graph, observability, temporal, policy, procedures, scopes)
+├── tests/                   # pytest suite (168 tests: core, graph, observability, temporal, policy, procedures, scopes, exposed-tools, procedure-outcomes, graph-context, batch)
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```
