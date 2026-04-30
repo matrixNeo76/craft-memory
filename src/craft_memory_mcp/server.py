@@ -95,6 +95,8 @@ from craft_memory_mcp.db import (
     get_memory_history as _db_get_memory_history,
     invalidate_memory as _db_invalidate_memory,
     list_needs_review as _db_list_needs_review,
+    MemoryClass as _MemoryClass,
+    classify_memory_event as _db_classify_memory_event,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1105,6 +1107,43 @@ def approve_memory(memory_id: int) -> str:
     if not ok:
         return f'Memory #{memory_id} not found in this workspace.'
     return f'Memory #{memory_id} approved and restored to active status.'
+
+
+# --- Sprint 3: Boundary Detection Policy ---
+
+@mcp.tool()
+def classify_event(
+    content: str,
+    importance: int = 5,
+    category: str = "",
+) -> str:
+    """Classify a memory event and recommend the best storage strategy.
+
+    Use this BEFORE calling remember/upsert_fact/add_open_loop to determine
+    which tool is most appropriate for a given piece of information.
+
+    Returns: classification (DISCARD/EPISODIC/FACT_CANDIDATE/OPEN_LOOP/
+    PROCEDURE_CANDIDATE/CORE_CANDIDATE) + reason + recommended action.
+    """
+    signals = {"importance": importance}
+    if category:
+        signals["category"] = category
+    cls, reason = _db_classify_memory_event(content, context_signals=signals)
+    nl = chr(10)
+    action_map = {
+        _MemoryClass.DISCARD: "Do not save — content is too short or trivial.",
+        _MemoryClass.EPISODIC: "Use remember() with appropriate category.",
+        _MemoryClass.FACT_CANDIDATE: "Use upsert_fact() with a clear key and value.",
+        _MemoryClass.OPEN_LOOP: "Use add_open_loop() to track as a pending task.",
+        _MemoryClass.PROCEDURE_CANDIDATE: "Use remember(category='note') now; save_procedure() in Sprint 4.",
+        _MemoryClass.CORE_CANDIDATE: "Use remember() then promote_to_core() for persistence.",
+    }
+    lines = [
+        f"Classification: {cls.value.upper()}",
+        f"Reason: {reason}",
+        f"Recommended action: {action_map[cls]}",
+    ]
+    return nl.join(lines)
 
 
 def run_server():

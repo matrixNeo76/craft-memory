@@ -1519,3 +1519,91 @@ def approve_memory(
     )
     conn.commit()
     return True
+
+
+# --- Sprint 3: Boundary Detection Policy ---
+
+import re as _re
+from enum import Enum
+
+
+class MemoryClass(str, Enum):
+    """Classification of a memory event into the most appropriate storage strategy."""
+    DISCARD = "discard"
+    EPISODIC = "episodic"
+    FACT_CANDIDATE = "fact_candidate"
+    OPEN_LOOP = "open_loop"
+    PROCEDURE_CANDIDATE = "procedure_candidate"
+    CORE_CANDIDATE = "core_candidate"
+
+
+_TRIVIAL_PATTERN = _re.compile(
+    r"^(ok|yes|no|done|got it|understood|sure|thanks|ok thanks|noted|agreed|correct|right)[\.\!\?]*$",
+    _re.IGNORECASE,
+)
+
+_LOOP_KEYWORDS = frozenset({
+    "todo", "fixme", "need to", "must fix", "pending",
+    "blocked", "waiting for", "follow up", "follow-up",
+})
+
+_CORE_KEYWORDS = frozenset({
+    "always", "never", "critical", "invariant",
+    "rule:", "policy:", "must always", "must never",
+})
+
+_FACT_KEYWORDS = frozenset({
+    "the db", "the api", "the url", "the port", "the key", "the version",
+    "is set to", "is configured", "equals", "means", "defined as", "is always",
+})
+
+
+def classify_memory_event(
+    content: str,
+    context_signals: dict | None = None,
+    conn: sqlite3.Connection | None = None,
+    workspace_id: str | None = None,
+) -> tuple["MemoryClass", str]:
+    """Classify a memory event into the most appropriate storage strategy.
+
+    Returns a (MemoryClass, reason) tuple. Rules are applied in priority order:
+    DISCARD > OPEN_LOOP > PROCEDURE_CANDIDATE > CORE_CANDIDATE > FACT_CANDIDATE > EPISODIC.
+
+    context_signals: optional dict with 'importance' (int 1-10) and 'category' (str).
+    conn/workspace_id: optional — reserved for future FTS5 frequency checks.
+    """
+    signals = context_signals or {}
+    importance: int = int(signals.get("importance", 5))
+    content_stripped = content.strip()
+    content_lower = content_stripped.lower()
+
+    # Rule 1: Too short → discard
+    if len(content_stripped) < 15:
+        return MemoryClass.DISCARD, "content too short (<15 chars)"
+
+    # Rule 2: Trivial conversational filler → discard
+    if _TRIVIAL_PATTERN.match(content_lower):
+        return MemoryClass.DISCARD, "trivial conversational response"
+
+    # Rule 3: Task/todo/blocked keywords → open_loop
+    if any(kw in content_lower for kw in _LOOP_KEYWORDS):
+        return MemoryClass.OPEN_LOOP, "loop/task keyword detected"
+
+    # Rule 4: Multi-step procedure pattern → procedure_candidate
+    step_hits = sum(
+        1 for i in range(1, 6) if f"step {i}" in content_lower
+    )
+    keyword_hits = sum(1 for kw in ("first:", "then:", "finally:", "workflow:", "process:") if kw in content_lower)
+    if step_hits >= 2 or keyword_hits >= 2:
+        return MemoryClass.PROCEDURE_CANDIDATE, "multi-step procedure pattern detected"
+
+    # Rule 5: High importance or invariant keywords → core_candidate
+    if importance >= 8 or any(kw in content_lower for kw in _CORE_KEYWORDS):
+        return MemoryClass.CORE_CANDIDATE, "high importance or invariant keyword"
+
+    # Rule 6: Factual statement patterns → fact_candidate
+    if any(kw in content_lower for kw in _FACT_KEYWORDS):
+        return MemoryClass.FACT_CANDIDATE, "factual statement pattern detected"
+
+    # Default → episodic memory
+    return MemoryClass.EPISODIC, "general episodic memory"
