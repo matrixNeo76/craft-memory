@@ -62,12 +62,17 @@ from craft_memory_mcp.db import (
     daily_maintenance as _db_daily_maintenance,
     dedup_memories as _db_dedup_memories,
     delete_old_memories as _db_delete_old_memories,
+    find_similar_memories as _db_find_similar_memories,
     get_connection as _db_get_connection,
     get_facts as _db_get_facts,
     get_latest_summary as _db_get_latest_summary,
     get_recent_memory as _db_get_recent_memory,
+    get_relations as _db_get_relations,
+    god_facts as _db_god_facts,
+    link_memories as _db_link_memories,
     list_open_loops as _db_list_open_loops,
     mark_stale_loops as _db_mark_stale_loops,
+    memory_diff as _db_memory_diff,
     remember as _db_remember,
     register_session as _db_register_session,
     save_summary as _db_save_summary,
@@ -290,6 +295,7 @@ def upsert_fact(
     value: str,
     scope: str = "workspace",
     confidence: float = 1.0,
+    confidence_type: str = "extracted",
 ) -> str:
     """Store or update a stable fact about the project. Use for confirmed knowledge.
 
@@ -298,16 +304,17 @@ def upsert_fact(
         value: Fact value
         scope: Fact scope (default: workspace)
         confidence: Confidence level 0.0-1.0 (default: 1.0)
+        confidence_type: extracted (observed directly) | inferred (reasoned) | ambiguous (uncertain)
 
     Returns:
         Confirmation with fact ID
     """
     conn = _get_conn()
     fact_id = _db_upsert_fact(
-        conn, key, value, WORKSPACE_ID, scope, confidence, CRAFT_SESSION_ID,
+        conn, key, value, WORKSPACE_ID, scope, confidence, CRAFT_SESSION_ID, confidence_type,
     )
     _maybe_checkpoint(conn)
-    return f"Fact #{fact_id} upserted: {key} = {value[:100]}"
+    return f"Fact #{fact_id} upserted: [{confidence_type}] {key} = {value[:100]}"
 
 
 # ─── Tool: list_open_loops ───────────────────────────────────────────
@@ -587,6 +594,196 @@ def search_by_tag(
             f"  {r['content'][:200]}"
         )
     return "\n\n".join(lines)
+
+
+# ─── Tool: link_memories ────────────────────────────────────────────
+
+@mcp.tool()
+def link_memories(
+    source_id: int,
+    target_id: int,
+    relation: str,
+    confidence_type: str = "extracted",
+    confidence_score: float = 1.0,
+) -> str:
+    """Create a directed relation between two memories (knowledge graph edge).
+
+    Args:
+        source_id: Source memory ID
+        target_id: Target memory ID
+        relation: caused_by | contradicts | extends | implements | supersedes | semantically_similar_to
+        confidence_type: extracted (you observed it) | inferred (reasoned) | ambiguous (uncertain)
+        confidence_score: Strength of the relation 0.0-1.0 (default: 1.0)
+
+    Returns:
+        Confirmation or duplicate notice
+    """
+    conn = _get_conn()
+    rel_id = _db_link_memories(
+        conn, source_id, target_id, relation,
+        WORKSPACE_ID, confidence_type, confidence_score,
+    )
+    if rel_id is None:
+        return f"Relation already exists or invalid: #{source_id} --{relation}--> #{target_id}"
+    _maybe_checkpoint(conn)
+    return f"Relation #{rel_id} created: #{source_id} --{relation} [{confidence_type}]--> #{target_id}"
+
+
+# ─── Tool: get_relations ────────────────────────────────────────────
+
+@mcp.tool()
+def get_relations(
+    memory_id: int,
+    direction: str = "both",
+) -> str:
+    """Get all graph relations for a memory (neighbors in the knowledge graph).
+
+    Args:
+        memory_id: Memory ID to inspect
+        direction: out (edges FROM this memory) | in (edges TO this memory) | both
+
+    Returns:
+        List of related memories with relation type and confidence
+    """
+    conn = _get_conn()
+    results = _db_get_relations(conn, memory_id, WORKSPACE_ID, direction)
+    if not results:
+        return f"No relations found for memory #{memory_id}."
+
+    lines = [f"Relations for #{memory_id} ({len(results)} edges):\n"]
+    for r in results:
+        arrow = f"#{memory_id} --{r['relation']} [{r['confidence_type']}]--> #{r['target_id']}"
+        if r["direction"] == "in":
+            arrow = f"#{r['source_id']} --{r['relation']} [{r['confidence_type']}]--> #{memory_id}"
+        lines.append(f"{arrow}\n  {r['other_content'][:120]}")
+    return "\n\n".join(lines)
+
+
+# ─── Tool: find_similar ─────────────────────────────────────────────
+
+@mcp.tool()
+def find_similar(
+    memory_id: int,
+    top_n: int = 5,
+    auto_link: bool = False,
+) -> str:
+    """Find memories similar to a given one using FTS5 BM25 scoring.
+
+    Args:
+        memory_id: Memory ID to find similarities for
+        top_n: Max results (default: 5)
+        auto_link: If True, automatically create INFERRED 'semantically_similar_to' edges
+                   for strong matches (BM25 score < -1.5)
+
+    Returns:
+        List of similar memories with similarity scores
+    """
+    conn = _get_conn()
+    results = _db_find_similar_memories(conn, memory_id, WORKSPACE_ID, top_n, auto_link)
+    if not results:
+        return f"No similar memories found for #{memory_id}."
+
+    action = " (INFERRED links created for strong matches)" if auto_link else ""
+    lines = [f"Similar to #{memory_id}{action} ({len(results)} found):\n"]
+    for r in results:
+        lines.append(
+            f"#{r['id']} [{r['category']}] importance={r['importance']} "
+            f"similarity={r['similarity_score']}\n"
+            f"  {r['content'][:200]}"
+        )
+    return "\n\n".join(lines)
+
+
+# ─── Tool: god_facts ────────────────────────────────────────────────
+
+@mcp.tool()
+def god_facts(
+    top_n: int = 10,
+) -> str:
+    """Return the most impactful facts — core knowledge nodes referenced most in memories.
+
+    Score = confidence × type_bonus × (1 + mention_count × 0.2)
+    EXTRACTED > INFERRED > AMBIGUOUS at equal confidence.
+    Use to identify the core concepts and architectural decisions of the workspace.
+
+    Args:
+        top_n: Max results (default: 10)
+
+    Returns:
+        Ranked list of facts with god_score, confidence_type, and mention_count
+    """
+    conn = _get_conn()
+    results = _db_god_facts(conn, WORKSPACE_ID, top_n)
+    if not results:
+        return "No facts found for this workspace."
+
+    lines = ["God Facts (most impactful):\n"]
+    for i, f in enumerate(results, 1):
+        ctype = f.get("confidence_type", "extracted")
+        lines.append(
+            f"{i}. [{ctype}] {f['key']} (score={f['god_score']}, "
+            f"confidence={f['confidence']}, mentions={f['mention_count']})\n"
+            f"   {f['value'][:150]}"
+        )
+    return "\n\n".join(lines)
+
+
+# ─── Tool: memory_diff ──────────────────────────────────────────────
+
+@mcp.tool()
+def memory_diff(
+    since_epoch: int,
+) -> str:
+    """Return what changed in memory since a given Unix epoch timestamp.
+
+    Useful at session start to understand what happened in previous sessions.
+    Tip: use int(time.time()) - 86400 for last 24h, or a session's started_at_epoch.
+
+    Args:
+        since_epoch: Unix timestamp to diff from
+
+    Returns:
+        Summary of new memories, updated facts, new/closed loops since that time
+    """
+    conn = _get_conn()
+    diff = _db_memory_diff(conn, WORKSPACE_ID, since_epoch)
+
+    lines = [
+        f"Memory diff since {diff['since_iso'][:19]} UTC\n",
+        f"Summary: {diff['summary']}\n",
+    ]
+
+    if diff["updated_facts"]:
+        lines.append("--- Updated Facts ---")
+        for f in diff["updated_facts"]:
+            ctype = f.get("confidence_type", "extracted")
+            lines.append(f"  [{ctype}] {f['key']}: {f['value'][:100]} (updated {f['updated_at'][:10]})")
+        lines.append("")
+
+    if diff["new_loops"]:
+        lines.append("--- New Open Loops ---")
+        for l in diff["new_loops"]:
+            lines.append(f"  #{l['id']} [{l['priority']}] {l['title']}")
+        lines.append("")
+
+    if diff["closed_loops"]:
+        lines.append("--- Closed Loops ---")
+        for l in diff["closed_loops"]:
+            res = f" → {l['resolution'][:80]}" if l.get("resolution") else ""
+            lines.append(f"  #{l['id']} {l['title']}{res}")
+        lines.append("")
+
+    if diff["new_memories"]:
+        lines.append(f"--- New Memories ({len(diff['new_memories'])}) ---")
+        for m in diff["new_memories"][:10]:
+            lines.append(
+                f"  #{m['id']} [{m['category']}] importance={m['importance']} "
+                f"({m['created_at'][:10]}): {m['content'][:120]}"
+            )
+        if len(diff["new_memories"]) > 10:
+            lines.append(f"  ... and {len(diff['new_memories']) - 10} more")
+
+    return "\n".join(lines)
 
 
 # ─── Entry Point (called by CLI or directly) ─────────────────────────

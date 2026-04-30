@@ -26,9 +26,18 @@ def _now_epoch() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 
-def _content_hash(content: str) -> str:
-    """SHA-256 hash of content for dedup."""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+def _content_hash(content: str, kind: str = "memory") -> str:
+    """Full SHA-256 hash of content + kind namespace for dedup.
+
+    kind namespace prevents hash collisions across different entity types.
+    NOTE: legacy entries used [:16] truncated hashes — mixed state is acceptable
+    since UNIQUE(session_id, content_hash) deduplicates per-session only.
+    """
+    h = hashlib.sha256()
+    h.update(content.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(kind.encode("utf-8"))
+    return h.hexdigest()
 
 
 def _db_path(workspace_id: str) -> Path:
@@ -282,19 +291,21 @@ def upsert_fact(
     scope: str = "workspace",
     confidence: float = 1.0,
     source_session: str | None = None,
+    confidence_type: str = "extracted",
 ) -> int:
     """Insert or update a fact. Returns row id."""
     now_iso = _now_iso()
     conn.execute(
         """INSERT INTO facts (key, value, workspace_id, scope, confidence,
-                              source_session, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                              confidence_type, source_session, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(key, workspace_id, scope)
            DO UPDATE SET value=excluded.value, confidence=excluded.confidence,
+                         confidence_type=excluded.confidence_type,
                          source_session=excluded.source_session,
                          updated_at=excluded.updated_at""",
         (key, value, workspace_id, scope, confidence,
-         source_session, now_iso, now_iso),
+         confidence_type, source_session, now_iso, now_iso),
     )
     conn.commit()
     row = conn.execute(
@@ -669,6 +680,223 @@ def search_by_tag(
     ).fetchall()
     return [dict(r) for r in rows]
 
+
+# ─── Knowledge Graph Layer ───────────────────────────────────────────
+
+def link_memories(
+    conn: sqlite3.Connection,
+    source_id: int,
+    target_id: int,
+    relation: str,
+    workspace_id: str,
+    confidence_type: str = "extracted",
+    confidence_score: float = 1.0,
+) -> int | None:
+    """Create a directed relation between two memories. Returns row id or None if duplicate/invalid."""
+    valid_relations = {
+        "caused_by", "contradicts", "extends",
+        "implements", "supersedes", "semantically_similar_to",
+    }
+    if relation not in valid_relations:
+        return None
+    now_epoch = _now_epoch()
+    try:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO memory_relations
+               (source_id, target_id, relation, confidence_type, confidence_score,
+                workspace_id, created_at_epoch)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (source_id, target_id, relation, confidence_type,
+             confidence_score, workspace_id, now_epoch),
+        )
+        conn.commit()
+        return cursor.lastrowid if cursor.rowcount > 0 else None
+    except sqlite3.Error:
+        return None
+
+
+def get_relations(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    direction: str = "both",
+) -> list[dict[str, Any]]:
+    """Get all relations for a memory. direction: 'out' | 'in' | 'both'."""
+    rows: list[Any] = []
+    if direction in ("out", "both"):
+        rows += conn.execute(
+            """SELECT mr.id, mr.source_id, mr.target_id, mr.relation,
+                      mr.confidence_type, mr.confidence_score,
+                      m.content AS other_content, m.category AS other_category,
+                      'out' AS direction
+               FROM memory_relations mr JOIN memories m ON mr.target_id = m.id
+               WHERE mr.source_id = ? AND mr.workspace_id = ?""",
+            (memory_id, workspace_id),
+        ).fetchall()
+    if direction in ("in", "both"):
+        rows += conn.execute(
+            """SELECT mr.id, mr.source_id, mr.target_id, mr.relation,
+                      mr.confidence_type, mr.confidence_score,
+                      m.content AS other_content, m.category AS other_category,
+                      'in' AS direction
+               FROM memory_relations mr JOIN memories m ON mr.source_id = m.id
+               WHERE mr.target_id = ? AND mr.workspace_id = ?""",
+            (memory_id, workspace_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_similar_memories(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    top_n: int = 5,
+    auto_link: bool = False,
+) -> list[dict[str, Any]]:
+    """Find memories similar to a given one using FTS5 BM25.
+
+    If auto_link=True, creates INFERRED 'semantically_similar_to' edges
+    for good matches (BM25 score < -1.5).
+    Returns list of similar memories with scores.
+    """
+    # Get the source memory content
+    source = conn.execute(
+        "SELECT content FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if not source:
+        return []
+
+    import re as _re_local
+    # Build FTS query: strip non-alphanumeric chars to avoid FTS5 syntax errors
+    # (e.g. "full-text" would be parsed as subtraction in FTS5)
+    raw = source["content"][:80].split()
+    words = [_re_local.sub(r"[^a-zA-Z0-9]", "", w) for w in raw]
+    words = [w for w in words if len(w) > 3][:8]
+    if not words:
+        return []
+
+    fts_query = " OR ".join(words)
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.content, m.category, m.importance,
+                      bm25(memories_fts) AS score
+               FROM memories m
+               JOIN memories_fts fts ON m.id = fts.rowid
+               WHERE memories_fts MATCH ?
+               AND m.workspace_id = ?
+               AND m.id != ?
+               ORDER BY score ASC
+               LIMIT ?""",
+            [fts_query, workspace_id, memory_id, top_n],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        r = dict(row)
+        r["similarity_score"] = round(abs(r["score"]), 3)
+        results.append(r)
+        if auto_link and r["score"] < -1.5:
+            link_memories(
+                conn, memory_id, row["id"], "semantically_similar_to",
+                workspace_id, "inferred",
+                min(1.0, abs(r["score"]) / 10.0),
+            )
+    return results
+
+
+def god_facts(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    top_n: int = 10,
+) -> list[dict[str, Any]]:
+    """Return the most impactful facts — those most referenced in memories.
+
+    Score = confidence * (1 + mention_count * 0.2)
+    EXTRACTED facts outrank INFERRED at same mention count.
+    """
+    facts = get_facts(conn, workspace_id)
+    result = []
+    for fact in facts:
+        key = fact["key"]
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE workspace_id = ? AND content LIKE ?",
+                (workspace_id, f"%{key}%"),
+            ).fetchone()[0]
+        except sqlite3.Error:
+            count = 0
+        # EXTRACTED facts get a small bonus over INFERRED
+        type_bonus = {"extracted": 1.0, "inferred": 0.8, "ambiguous": 0.5}.get(
+            fact.get("confidence_type", "extracted"), 1.0
+        )
+        score = fact["confidence"] * type_bonus * (1.0 + count * 0.2)
+        result.append({**fact, "mention_count": count, "god_score": round(score, 3)})
+    result.sort(key=lambda x: x["god_score"], reverse=True)
+    return result[:top_n]
+
+
+def memory_diff(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    since_epoch: int,
+) -> dict[str, Any]:
+    """Return what changed in memory since a given Unix epoch timestamp.
+
+    Useful for session-start context injection and handoff summaries.
+    """
+    since_iso = datetime.fromtimestamp(since_epoch, tz=timezone.utc).isoformat()
+
+    new_memories = conn.execute(
+        """SELECT id, category, importance, content, created_at, created_at_epoch, tags
+           FROM memories WHERE workspace_id = ? AND created_at_epoch > ?
+           ORDER BY created_at_epoch ASC""",
+        (workspace_id, since_epoch),
+    ).fetchall()
+
+    updated_facts = conn.execute(
+        """SELECT key, value, confidence, confidence_type, updated_at
+           FROM facts WHERE workspace_id = ? AND updated_at > ?
+           ORDER BY updated_at ASC""",
+        (workspace_id, since_iso),
+    ).fetchall()
+
+    new_loops = conn.execute(
+        """SELECT id, title, priority, status, created_at, created_at_epoch
+           FROM open_loops WHERE workspace_id = ? AND created_at_epoch > ?
+           ORDER BY created_at_epoch ASC""",
+        (workspace_id, since_epoch),
+    ).fetchall()
+
+    closed_loops = conn.execute(
+        """SELECT id, title, resolution, closed_at, closed_at_epoch
+           FROM open_loops WHERE workspace_id = ? AND closed_at_epoch > ?
+           AND status = 'closed' ORDER BY closed_at_epoch ASC""",
+        (workspace_id, since_epoch),
+    ).fetchall()
+
+    nm = [dict(r) for r in new_memories]
+    uf = [dict(r) for r in updated_facts]
+    nl = [dict(r) for r in new_loops]
+    cl = [dict(r) for r in closed_loops]
+
+    return {
+        "since_epoch": since_epoch,
+        "since_iso": since_iso,
+        "new_memories": nm,
+        "updated_facts": uf,
+        "new_loops": nl,
+        "closed_loops": cl,
+        "summary": (
+            f"{len(nm)} new memories, {len(uf)} updated facts, "
+            f"{len(nl)} new loops, {len(cl)} closed loops"
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
 
 def update_memory(
     conn: sqlite3.Connection,
