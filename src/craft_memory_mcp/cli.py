@@ -7,7 +7,7 @@ Usage:
     craft-memory status
     craft-memory stop
     craft-memory ensure
-    craft-memory install [--workspace PATH]
+    craft-memory install [--workspace PATH] [--merge] [--overwrite] [--dry-run]
 """
 
 import argparse
@@ -207,15 +207,107 @@ def cmd_ensure(args):
         sys.exit(1)
 
 
+def _diff_text(label: str, old: str, new: str) -> str:
+    """Return a unified diff string between old and new text."""
+    import difflib
+    lines = list(difflib.unified_diff(
+        old.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"{label} (existing)",
+        tofile=f"{label} (new)",
+        n=2,
+    ))
+    return "".join(lines)
+
+
+def _merge_automations(existing: dict, template: dict) -> tuple[dict, list[str], list[str]]:
+    """Merge template automations into existing, keyed by (event, name).
+
+    Returns (merged_dict, added_list, skipped_list).
+    Existing entries are never overwritten.
+    """
+    merged = {k: list(v) for k, v in existing.items()}
+    added: list[str] = []
+    skipped: list[str] = []
+
+    for event, entries in template.get("automations", {}).items():
+        existing_names = {e.get("name") for e in merged.get(event, [])}
+        for entry in entries:
+            name = entry.get("name", "<unnamed>")
+            if name in existing_names:
+                skipped.append(f"{event}/{name}")
+            else:
+                merged.setdefault(event, []).append(entry)
+                added.append(f"{event}/{name}")
+
+    return merged, added, skipped
+
+
+def _merge_bash_patterns(perms: dict, patterns: list[dict]) -> tuple[dict, list[str]]:
+    """Add missing allowedBashPatterns entries. Returns (updated_perms, added_list)."""
+    existing = perms.get("allowedBashPatterns", [])
+    existing_patterns = {e["pattern"] for e in existing}
+    added: list[str] = []
+    result = list(existing)
+    for p in patterns:
+        if p["pattern"] not in existing_patterns:
+            result.append(p)
+            added.append(p["pattern"])
+    perms_out = dict(perms)
+    perms_out["allowedBashPatterns"] = result
+    return perms_out, added
+
+
+def _merge_mcp_patterns(perms: dict, patterns: list[dict]) -> tuple[dict, list[str]]:
+    """Add missing allowedMcpPatterns entries. Returns (updated_perms, added_list)."""
+    existing = perms.get("allowedMcpPatterns", [])
+    existing_patterns = {e["pattern"] for e in existing}
+    added: list[str] = []
+    result = list(existing)
+    for p in patterns:
+        if p["pattern"] not in existing_patterns:
+            result.append(p)
+            added.append(p["pattern"])
+    perms_out = dict(perms)
+    perms_out["allowedMcpPatterns"] = result
+    return perms_out, added
+
+
+def _write_or_dry(path, content: str, dry_run: bool, label: str) -> None:
+    """Write a text file, or print path in dry-run mode."""
+    if dry_run:
+        print(f"  [dry-run] would write: {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(f"  + {label}: {path}")
+
+
 def cmd_install(args):
-    """Install Craft Memory source into a Craft Agents workspace."""
+    """Install Craft Memory source into a Craft Agents workspace.
+
+    Default (no flags): merge-safe — create missing files, never overwrite existing.
+    --merge: auto-merge JSON files (automations by name, perms by pattern);
+             update skills if source is newer.
+    --overwrite: force-overwrite all files (destructive).
+    --dry-run: show what would happen without writing.
+    """
+    import difflib
+    import secrets
     from pathlib import Path
 
-    # Determine workspace directory
+    dry = args.dry_run
+    overwrite = args.overwrite
+    merge = args.merge or overwrite  # --overwrite implies merge logic too
+
+    def _write_json(path: Path, data: dict, label: str) -> None:
+        content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        _write_or_dry(path, content, dry, label)
+
+    # ── Locate workspace ───────────────────────────────────────────────
     if args.workspace:
         ws_dir = Path(args.workspace)
     else:
-        # Auto-detect: find first workspace with config.json
         base = Path.home() / ".craft-agent" / "workspaces"
         if not base.exists():
             print("ERROR: No Craft Agents workspaces found", file=sys.stderr)
@@ -241,122 +333,154 @@ def cmd_install(args):
         print(f"ERROR: Workspace not found: {ws_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Create source directory
+    # Repo root: cli.py is at src/craft_memory_mcp/cli.py → 3 levels up
+    repo_root = Path(__file__).parent.parent.parent
+    craft_agents_dir = repo_root / "craft-agents"
+
+    print(f"\nInstalling Craft Memory to workspace: {ws_dir}")
+    if dry:
+        print("  (dry-run mode — no files will be written)\n")
+
+    # ── Source: config.json ────────────────────────────────────────────
     source_dir = ws_dir / "sources" / "memory"
-    source_dir.mkdir(parents=True, exist_ok=True)
+    if not dry:
+        source_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write config.json
-    import secrets
-    config_id = f"memory_{secrets.token_hex(4)}"
-    config = {
-        "id": config_id,
-        "name": "Craft Memory",
-        "slug": "memory",
-        "enabled": True,
-        "provider": "craft-memory",
-        "type": "mcp",
-        "icon": "🧠",
-        "tagline": "Persistent cross-session memory with SQLite + FTS5",
-        "mcp": {
-            "transport": "http",
-            "url": f"http://localhost:{_port()}/mcp",
-            "authType": "none",
-        },
-    }
     config_path = source_dir / "config.json"
-    if config_path.exists():
-        print(f"  Source config already exists: {config_path} (skipping)")
+    if config_path.exists() and not overwrite:
+        print(f"  = source config exists (skip): {config_path}")
     else:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        print(f"  ✓ Created source config: {config_path}")
+        # Load template from craft-agents/source/config.json if available
+        tpl_config_path = craft_agents_dir / "source" / "config.json"
+        if tpl_config_path.exists():
+            config = json.loads(tpl_config_path.read_text(encoding="utf-8"))
+        else:
+            config = {
+                "name": "Craft Memory",
+                "slug": "memory",
+                "enabled": True,
+                "provider": "craft-memory",
+                "type": "mcp",
+                "icon": "🧠",
+                "tagline": "Persistent cross-session memory with SQLite + FTS5",
+                "mcp": {"transport": "http", "url": f"http://localhost:{_port()}/mcp", "authType": "none"},
+            }
+        # Inject a stable ID and correct port
+        if "id" not in config or overwrite:
+            config["id"] = f"memory_{secrets.token_hex(4)}"
+        config.setdefault("mcp", {})["url"] = f"http://localhost:{_port()}/mcp"
+        _write_json(config_path, config, "source config")
 
-    # Write permissions.json
-    perms = {
-        "allowedMcpPatterns": [
-            {"pattern": "remember", "comment": "Store episodic memories"},
-            {"pattern": "search_memory", "comment": "Search memories via FTS5"},
-            {"pattern": "get_recent_memory", "comment": "Get recent memories"},
-            {"pattern": "upsert_fact", "comment": "Store/update stable facts"},
-            {"pattern": "list_open_loops", "comment": "List open loops"},
-            {"pattern": "close_open_loop", "comment": "Close open loops"},
-            {"pattern": "summarize_scope", "comment": "Generate scope summary"},
-        ]
-    }
+    # ── Source: permissions.json ───────────────────────────────────────
+    mcp_patterns = [
+        {"pattern": "remember", "comment": "Store episodic memories"},
+        {"pattern": "search_memory", "comment": "Search memories via FTS5"},
+        {"pattern": "get_recent_memory", "comment": "Get recent memories"},
+        {"pattern": "upsert_fact", "comment": "Store/update stable facts"},
+        {"pattern": "find_similar", "comment": "Semantic similarity search"},
+        {"pattern": "list_open_loops", "comment": "List open loops"},
+        {"pattern": "close_open_loop", "comment": "Close open loops"},
+        {"pattern": "summarize_scope", "comment": "Generate scope summary"},
+    ]
     perms_path = source_dir / "permissions.json"
-    if perms_path.exists():
-        print(f"  Permissions already exist: {perms_path} (skipping)")
+    if perms_path.exists() and not overwrite:
+        if merge:
+            existing_perms = json.loads(perms_path.read_text(encoding="utf-8"))
+            merged_perms, added_patterns = _merge_mcp_patterns(existing_perms, mcp_patterns)
+            if added_patterns:
+                _write_json(perms_path, merged_perms, f"source perms (merged +{len(added_patterns)})")
+            else:
+                print(f"  = source perms up-to-date: {perms_path}")
+        else:
+            print(f"  = source perms exist (skip): {perms_path}")
     else:
-        with open(perms_path, "w", encoding="utf-8") as f:
-            json.dump(perms, f, indent=2)
-        print(f"  ✓ Created permissions: {perms_path}")
+        _write_json(perms_path, {"allowedMcpPatterns": mcp_patterns}, "source perms")
 
-    # Write guide.md
-    guide = """# Craft Memory
-
-Persistent cross-session memory for your Craft Agents workspace.
-
-## What it does
-- **Remember**: Store decisions, discoveries, and key takeaways across sessions
-- **Facts**: Stable knowledge that persists (tech stack, conventions, patterns)
-- **Open loops**: Track incomplete tasks and follow-ups
-- **Search**: Full-text search across all memories
-
-## Available tools
-| Tool | Purpose |
-|------|---------|
-| `remember` | Store an episodic memory |
-| `search_memory` | Full-text search |
-| `get_recent_memory` | Get recent memories |
-| `upsert_fact` | Store/update a stable fact |
-| `list_open_loops` | List open loops |
-| `close_open_loop` | Close an open loop |
-| `summarize_scope` | Generate comprehensive summary |
-
-## When to use each tool
-- **Session start**: `get_recent_memory` + `list_open_loops` to recover context
-- **During work**: `remember` for decisions/discoveries, `upsert_fact` for confirmed knowledge
-- **Session end**: `remember` key takeaways + `summarize_scope` for handoff
-
-## Troubleshooting
-| Issue | Solution |
-|-------|----------|
-| Tool not found | Server may be down. Ask: "start memory server" |
-| "Session not found" | Server was restarted. Just retry |
-| "Not connected" | Check HTTP transport is configured, not stdio |
-"""
+    # ── Source: guide.md ──────────────────────────────────────────────
     guide_path = source_dir / "guide.md"
-    if guide_path.exists():
-        print(f"  Guide already exists: {guide_path} (skipping)")
+    tpl_guide_path = craft_agents_dir / "source" / "guide.md"
+    if guide_path.exists() and not overwrite:
+        if merge and tpl_guide_path.exists():
+            old_guide = guide_path.read_text(encoding="utf-8")
+            new_guide = tpl_guide_path.read_text(encoding="utf-8")
+            if old_guide.strip() == new_guide.strip():
+                print(f"  = guide.md up-to-date")
+            else:
+                diff = _diff_text("guide.md", old_guide, new_guide)
+                print(f"  ~ guide.md differs (--merge: overwriting)")
+                if diff:
+                    print(diff[:1000] + ("  ...(truncated)" if len(diff) > 1000 else ""))
+                _write_or_dry(guide_path, new_guide, dry, "guide.md")
+        else:
+            print(f"  = guide.md exists (skip)")
     else:
-        with open(guide_path, "w", encoding="utf-8") as f:
-            f.write(guide)
-        print(f"  ✓ Created guide: {guide_path}")
+        if tpl_guide_path.exists():
+            _write_or_dry(guide_path, tpl_guide_path.read_text(encoding="utf-8"), dry, "guide.md")
+        else:
+            print(f"  WARN: guide template not found at {tpl_guide_path}")
 
-    # Update enabledSourceSlugs in workspace config.json
+    # ── Workspace config: enabledSourceSlugs ──────────────────────────
     ws_config_path = ws_dir / "config.json"
     if ws_config_path.exists():
-        with open(ws_config_path, "r", encoding="utf-8") as f:
-            ws_config = json.load(f)
+        ws_config = json.loads(ws_config_path.read_text(encoding="utf-8"))
         slugs = ws_config.get("defaults", {}).get("enabledSourceSlugs", [])
         if "memory" not in slugs:
             slugs.append("memory")
             ws_config.setdefault("defaults", {})["enabledSourceSlugs"] = slugs
-            with open(ws_config_path, "w", encoding="utf-8") as f:
-                json.dump(ws_config, f, indent=2)
-            print(f"  ✓ Added 'memory' to enabledSourceSlugs")
+            _write_json(ws_config_path, ws_config, "workspace config (enabledSourceSlugs)")
         else:
-            print(f"  'memory' already in enabledSourceSlugs")
+            print(f"  = 'memory' already in enabledSourceSlugs")
 
-    # Copy skills
+    # ── Workspace automations.json ─────────────────────────────────────
+    tpl_automations_path = craft_agents_dir / "automations.json"
+    ws_automations_path = ws_dir / "automations.json"
+    if tpl_automations_path.exists():
+        tpl_auto = json.loads(tpl_automations_path.read_text(encoding="utf-8"))
+        if ws_automations_path.exists():
+            existing_auto = json.loads(ws_automations_path.read_text(encoding="utf-8"))
+            merged_events, added, skipped = _merge_automations(
+                existing_auto.get("automations", {}), tpl_auto,
+            )
+            if added:
+                out = {"version": existing_auto.get("version", 2), "automations": merged_events}
+                _write_json(ws_automations_path, out, f"automations (merged +{len(added)})")
+                for a in added:
+                    print(f"    + {a}")
+            else:
+                print(f"  = automations up-to-date ({len(skipped)} already present)")
+            if skipped and not added:
+                for s in skipped[:5]:
+                    print(f"    = {s} (exists, skip)")
+        else:
+            # Create fresh automations.json from template
+            out = {"version": tpl_auto.get("version", 2), "automations": tpl_auto.get("automations", {})}
+            _write_json(ws_automations_path, out, "automations (new)")
+    else:
+        print(f"  WARN: automations template not found at {tpl_automations_path}")
+
+    # ── Workspace permissions.json: bash patterns ─────────────────────
+    bash_patterns = [
+        {"pattern": "^craft-memory\\s", "comment": "Allow craft-memory CLI commands"},
+    ]
+    ws_perms_path = ws_dir / "permissions.json"
+    if ws_perms_path.exists():
+        ws_perms = json.loads(ws_perms_path.read_text(encoding="utf-8"))
+    else:
+        ws_perms = {}
+    ws_perms_updated, bash_added = _merge_bash_patterns(ws_perms, bash_patterns)
+    if bash_added:
+        _write_json(ws_perms_path, ws_perms_updated, f"workspace perms (bash +{len(bash_added)})")
+    else:
+        print(f"  = workspace bash permissions up-to-date")
+
+    # ── Skills ────────────────────────────────────────────────────────
     skills_dir = ws_dir / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    # Skills live at the repo root: <craft-memory>/skills/
-    # Path(__file__) = src/craft_memory_mcp/cli.py → go up 3 levels to repo root
-    package_skills = Path(__file__).parent.parent.parent / "skills"
+    if not dry:
+        skills_dir.mkdir(parents=True, exist_ok=True)
+    package_skills = repo_root / "skills"
     skill_names = ["memory-start", "memory-protocol", "memory-maintenance", "session-handoff"]
     if package_skills.exists():
-        copied = 0
+        copied = updated = skipped_skills = 0
         for skill_name in skill_names:
             src_skill = package_skills / skill_name
             dst_skill = skills_dir / skill_name
@@ -364,28 +488,58 @@ Persistent cross-session memory for your Craft Agents workspace.
                 print(f"  WARN: skill not found: {src_skill}")
                 continue
             if dst_skill.exists():
-                print(f"  Skill already exists: {skill_name} (skipping)")
+                if merge:
+                    # Update if any source file is newer than destination
+                    src_mtime = max(f.stat().st_mtime for f in src_skill.rglob("*") if f.is_file())
+                    dst_mtime = max(
+                        (f.stat().st_mtime for f in dst_skill.rglob("*") if f.is_file()),
+                        default=0,
+                    )
+                    if src_mtime > dst_mtime:
+                        if not dry:
+                            shutil.rmtree(dst_skill)
+                            shutil.copytree(src_skill, dst_skill)
+                        print(f"  ~ skill updated: {skill_name}")
+                        updated += 1
+                    else:
+                        print(f"  = skill up-to-date: {skill_name}")
+                        skipped_skills += 1
+                else:
+                    print(f"  = skill exists (skip): {skill_name}")
+                    skipped_skills += 1
             else:
-                shutil.copytree(src_skill, dst_skill)
-                print(f"  Copied skill: {skill_name}")
+                if not dry:
+                    shutil.copytree(src_skill, dst_skill)
+                print(f"  + skill installed: {skill_name}")
                 copied += 1
+        summary_parts = []
         if copied:
-            print(f"  {copied} skill(s) installed to {skills_dir}")
+            summary_parts.append(f"{copied} installed")
+        if updated:
+            summary_parts.append(f"{updated} updated")
+        if skipped_skills:
+            summary_parts.append(f"{skipped_skills} unchanged")
+        if summary_parts:
+            print(f"  skills: {', '.join(summary_parts)}")
     else:
         print(f"  WARN: Skills source not found at {package_skills}")
         print(f"        Copy manually: {', '.join(skill_names)}")
 
-    # Ensure server is running
-    print(f"\n  Ensuring server is running...")
-    if not is_alive():
-        pid = start_server()
-        if pid and wait_for_alive():
-            print(f"  ✓ Server started (PID {pid})")
+    # ── Ensure server is running ───────────────────────────────────────
+    if not dry:
+        print(f"\n  Checking server...")
+        if not is_alive():
+            pid = start_server()
+            if pid and wait_for_alive():
+                print(f"  + Server started (PID {pid})")
+            else:
+                print(f"  WARN: Could not start server. Run: craft-memory ensure")
         else:
-            print(f"  ⚠ Could not start server. Run: craft-memory ensure")
+            print(f"  = Server already running on port {_port()}")
 
-    print(f"\n✓ Craft Memory installed to workspace: {ws_dir}")
-    print(f"  Next: Start a new Craft Agents session and say 'check my memory'")
+    print(f"\n{'[dry-run] ' if dry else ''}Done: Craft Memory installed to workspace: {ws_dir.name}")
+    if not dry:
+        print(f"  Next: Start a new session and run 'craft-memory check'")
 
 
 # ─── Argument parser ─────────────────────────────────────────────────
@@ -420,6 +574,18 @@ def build_parser() -> argparse.ArgumentParser:
     # install
     p_install = sub.add_parser("install", help="Install into a Craft Agents workspace")
     p_install.add_argument("--workspace", default=None, help="Path to workspace directory")
+    p_install.add_argument(
+        "--merge", action="store_true",
+        help="Auto-merge JSON files (automations by name, perms by pattern); update skills if newer",
+    )
+    p_install.add_argument(
+        "--overwrite", action="store_true",
+        help="Force-overwrite all files (implies --merge for JSON; destructive)",
+    )
+    p_install.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Show what would be written without making changes",
+    )
 
     return parser
 
