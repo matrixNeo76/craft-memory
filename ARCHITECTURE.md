@@ -1,7 +1,7 @@
 # Craft Memory System — Complete Architectural Documentation
 
 > **Date**: 2026-04-30
-> **Version**: 5.0 (Sprint 1–5 — 33 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy)
+> **Version**: 6.0 (Sprint 1–7 — 41 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy, graph context, batch ops)
 > **Environment**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -149,7 +149,7 @@ _PRIVATE_PATTERNS = _re.compile(
 )
 ```
 
-**33 tools exposed** (19 baseline + 14 added in Sprints 1–5):
+**41 tools exposed** (19 baseline + 22 added in Sprints 1–7):
 
 | Tool | Purpose | R/W | Sprint |
 |------|---------|-----|--------|
@@ -186,6 +186,14 @@ _PRIVATE_PATTERNS = _re.compile(
 | `search_procedures` | FTS5 search over procedures (name + trigger + steps) | Read | Sprint 4 |
 | `get_applicable_procedures` | Find the most applicable procedures for the current task context | Read | Sprint 4 |
 | `get_memory_bundle` | Batch-fetch N complete memories by ID list (Layer 3 coarse-to-fine retrieval) | Read | Sprint 5 |
+| `search_facts` | Keyword search on facts key or value; scope-filterable; ordered by confidence desc | Read | Sprint 5-Close |
+| `list_procedures` | List all procedures in workspace filtered by status (active/draft/deprecated) | Read | Sprint 5-Close |
+| `get_scope_ancestors` | Return scope + ancestor chain from specific to broad (session→global) | Read | Sprint 5-Close |
+| `consolidation_candidates` | Find old non-core memories with low effective importance ready for pruning | Read | Sprint 5-Close |
+| `record_procedure_outcome` | Record execution result (success/partial/failure) for a procedure; triggers confidence evolution | Write | Sprint 6 |
+| `get_procedure_outcomes` | Return recent execution outcomes for a procedure, newest first | Read | Sprint 6 |
+| `get_graph_context` | BFS multi-hop traversal: return center memory + neighbors up to N hops with edges and depth_map | Read | Sprint 7 |
+| `batch_remember` | Save N memories in one call (JSON array input); reduces MCP round-trips for session-end automation | Write | Sprint 7 |
 
 ### 3.2 File: `src/db.py`
 
@@ -263,6 +271,23 @@ SQLite data layer. Main functions:
 - `get_scope_ancestors(conn, scope) → list[str]` → reads `scope_hierarchy` table; returns scope + all ancestors from specific to broad; graceful fallback to hardcoded order if table missing
 - `get_memory_bundle(conn, memory_ids, workspace_id) → list[dict]` → batch-fetch by ID list with workspace isolation; missing IDs silently skipped; returns full row dicts
 
+**Sprint 5-Close — expose previously import-only functions**:
+- `search_facts(conn, query, workspace_id, scope) → list[dict]` → LIKE search on `(key, value)` ordered by confidence desc; complements `god_facts` with keyword-driven lookup
+- `list_procedures(conn, workspace_id, status, limit)` — already in Sprint 4; now also exposed as MCP tool `list_procedures`
+- `get_scope_ancestors` — already in Sprint 5; now also exposed as MCP tool `get_scope_ancestors`
+- `find_consolidation_candidates` — already implemented; now exposed as MCP tool `consolidation_candidates`
+
+**Procedure Outcome Tracking — Sprint 6** (migration 011_procedure_outcomes):
+- `record_procedure_outcome(conn, procedure_id, workspace_id, outcome, notes) → int` → INSERT into `procedure_outcomes`; validates outcome ∈ `{'success','partial','failure'}` (raises `ValueError` otherwise); returns row id
+- `get_procedure_outcomes(conn, procedure_id, workspace_id, limit) → list[dict]` → returns outcomes newest-first
+- `update_procedure_confidence(conn, procedure_id, workspace_id, recent_n=10) → float|None` → Bayesian blend: `new = clamp(old×0.3 + avg_score×0.7, 0.05, 0.95)`; scores: success=1.0, partial=0.5, failure=0.0; returns None if no outcomes
+- `_update_all_procedure_confidences(conn, workspace_id) → int` → iterates all procedures with outcomes, calls `update_procedure_confidence`; used by `daily_maintenance`
+- `daily_maintenance` extended: calls `_update_all_procedure_confidences`; returns dict now includes `procedures_confidence_updated` count
+
+**Multi-hop Graph Context + Batch Ops — Sprint 7**:
+- `get_graph_context(conn, memory_id, workspace_id, depth=2) → dict|None` → BFS from `memory_id` up to `depth` hops; traverses both inbound and outbound edges; uses `visited` set to handle cycles safely; returns `{center, nodes[], edges[], depth_map, total_nodes, total_edges}`; returns `None` if memory not found or wrong workspace
+- `batch_remember(conn, entries, session_id, workspace_id) → list[int|None]` → saves N memories in one call; each entry dict accepts `content`, `category`, `importance`, `scope`, `tags`; duplicates return `None` in that slot without error; preserves order
+
 ### 3.3 File: `src/schema.sql` + `src/migrations/`
 
 Base schema (v1) + versioned migrations:
@@ -280,6 +305,7 @@ Base schema (v1) + versioned migrations:
 | `procedures` | Named reusable workflows with trigger context and markdown steps | migration 009 (Sprint 4) |
 | `procedures_fts` | Standalone FTS5 index for procedures (porter tokenizer) | migration 009 (Sprint 4) |
 | `scope_hierarchy` | Scope inheritance chain (session→project→workspace→user→global) | migration 010 (Sprint 5) |
+| `procedure_outcomes` | Execution outcome records (success/partial/failure) per procedure for confidence evolution | migration 011 (Sprint 6) |
 
 **Applied migrations**:
 - `002_global_dedup.sql`: changes UNIQUE from `(session_id, content_hash)` to `(workspace_id, content_hash)`; recreates FTS5 with category/scope UNINDEXED
@@ -291,6 +317,7 @@ Base schema (v1) + versioned migrations:
 - `008_fact_temporal.sql` (Sprint 2): adds `valid_from`, `valid_to`, `superseded_by`, `lifecycle_status` to `memories`; `lifecycle_status CHECK IN ('active','superseded','invalidated','needs_review')`; partial index on `(workspace_id, lifecycle_status)`
 - `009_procedures.sql` (Sprint 4): creates `procedures` table with `UNIQUE(workspace_id, name)`; status `CHECK IN ('active','draft','deprecated')`; confidence `BETWEEN 0 AND 1`; standalone `procedures_fts USING fts5(name, trigger_context, steps_md, tokenize='porter ascii')`
 - `010_scope_hierarchy.sql` (Sprint 5): creates `scope_hierarchy` table with `scope` PK, `parent_scope` FK (self-referential), `level INTEGER`; seeds 5 canonical scopes: `session(0) → project(1) → workspace(2) → user(3) → global(4)`
+- `011_procedure_outcomes.sql` (Sprint 6): creates `procedure_outcomes` table with FK→`procedures(id)` CASCADE DELETE; `outcome CHECK IN ('success','partial','failure')`; two indexes: `(procedure_id, workspace_id)` and `(workspace_id, created_at_epoch DESC)`
 
 **`memory_relations` table** (introduced in v3.0, extended in v4.0):
 
@@ -767,11 +794,13 @@ Tools are organized into three groups to reduce cognitive load. The **core group
 | **core** | `remember`, `search_memory`, `get_recent_memory`, `upsert_fact`, `list_open_loops` | Every session — the default session flow |
 | **graph** | `link_memories`, `get_relations`, `find_similar`, `god_facts`, `memory_diff`, `search_by_tag` | Building or exploring relationships between memories |
 | **admin** | `run_maintenance`, `promote_to_core`, `summarize_scope`, `save_summary`, `update_memory`, `add_open_loop`, `close_open_loop`, `update_open_loop` | Lifecycle management and housekeeping |
-| **observability** | `memory_stats`, `generate_handoff`, `save_decision_record` | Diagnostics and session handoff (Sprint 1) |
+| **observability** | `memory_stats`, `explain_retrieval`, `generate_handoff`, `save_decision_record` | Diagnostics and session handoff (Sprint 1) |
 | **lifecycle** | `invalidate_memory`, `get_memory_history`, `flag_for_review`, `list_needs_review`, `approve_memory` | Memory lifecycle management — review, invalidation, supersession (Sprint 2) |
 | **policy** | `classify_event` | Boundary detection before storing a memory event (Sprint 3) |
-| **procedures** | `save_procedure`, `search_procedures`, `get_applicable_procedures` | Capturing and retrieving reusable workflows (Sprint 4) |
-| **retrieval** | `get_memory_bundle` | Layer 3 coarse-to-fine: batch-fetch full memory detail after search (Sprint 5) |
+| **procedures** | `save_procedure`, `search_procedures`, `get_applicable_procedures`, `list_procedures`, `record_procedure_outcome`, `get_procedure_outcomes` | Capturing, retrieving, and evolving reusable workflows (Sprints 4, 5-Close, 6) |
+| **retrieval** | `get_memory_bundle`, `get_graph_context`, `get_scope_ancestors`, `consolidation_candidates` | Layer 3 coarse-to-fine: full detail, neighborhood context, scope hierarchy (Sprints 5, 7) |
+| **facts** | `search_facts` | Keyword-driven fact lookup when `god_facts` is not specific enough (Sprint 5-Close) |
+| **batch** | `batch_remember` | Bulk memory storage — reduces MCP round-trips for session-end automation (Sprint 7) |
 
 Tool docstrings in `server.py` are prefixed with `[graph]` or `[admin]` for non-core tools. Core tools have no prefix — they are the default path.
 
