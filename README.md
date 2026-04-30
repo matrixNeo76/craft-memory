@@ -91,15 +91,19 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 
 | Feature | Description |
 |---------|-------------|
-| **Episodic memory** | Save decisions, discoveries, bugfixes with category and importance |
-| **Stable facts** | Key-value store for confirmed project knowledge (tech stack, URLs, conventions) |
-| **Open loops** | Track incomplete tasks across sessions with priority levels |
-| **Full-text search** | FTS5 with BM25 ranking and Porter stemmer |
-| **Auto-deduplication** | Content hash prevents duplicate memories |
-| **Session summaries** | Structured handoff documents between sessions |
+| **Episodic memory** | Save decisions, discoveries, bugfixes with category, importance, and optional tags |
+| **Stable facts** | Key-value store for confirmed project knowledge with confidence scores |
+| **Open loops** | Track incomplete tasks across sessions with priority levels (critical → low) |
+| **Hybrid FTS search** | FTS5 + BM25 × 0.7 + importance × 0.3 ranking; LIKE fallback for edge cases |
+| **Global deduplication** | Content hash unique per workspace — no duplicate across any session |
+| **Importance decay** | `effective_importance = importance × e^(-λ × age_days)` — older memories rank lower |
+| **Tags on memories** | Attach tags for topic-based retrieval via `search_by_tag` |
+| **Privacy stripping** | `<private>`, `<system-reminder>`, `<system>` blocks stripped before storage |
+| **Session summaries** | Structured handoff: decisions, facts learned, open loops, refs, next steps |
+| **Migration runner** | Versioned SQL migrations applied automatically on startup |
 | **4 automations** | SessionStart, SessionEnd, SchedulerTick, LabelAdd — all pre-configured |
 | **4 skills** | memory-protocol, memory-start, memory-maintenance, session-handoff |
-| **Local-first** | All data stays on your machine, no cloud sync |
+| **Local-first** | All data stays on your machine, no cloud sync, zero external dependencies |
 
 ---
 
@@ -107,13 +111,18 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 
 | Tool | Purpose |
 |------|---------|
-| `remember(content, category, scope, importance)` | Save an episodic memory. Categories: `decision`, `discovery`, `bugfix`, `feature`, `refactor`, `change`, `note` |
-| `search_memory(query, scope, limit)` | Full-text search over all memories (FTS5 + BM25) |
-| `get_recent_memory(scope, limit)` | Get the N most recent memories |
+| `remember(content, category, scope, importance, tags)` | Save an episodic memory. Categories: `decision`, `discovery`, `bugfix`, `feature`, `refactor`, `change`, `note` |
+| `update_memory(id, content, category, importance)` | Update an existing memory's content, category, or importance |
+| `search_memory(query, scope, limit)` | Full-text search over all memories (FTS5 + BM25 hybrid ranking) |
+| `search_by_tag(tag, scope, limit)` | Find memories by tag |
+| `get_recent_memory(scope, limit, max_tokens)` | Get memories ranked by importance decay; `max_tokens` caps the context budget |
 | `upsert_fact(key, value, scope, confidence)` | Save or update a stable fact. Idempotent. |
 | `list_open_loops(scope)` | List open tasks ordered by priority (critical → high → medium → low) |
+| `add_open_loop(title, description, priority, scope)` | Create a new open loop to track across sessions |
 | `close_open_loop(id, resolution)` | Close a loop with an optional resolution note |
 | `summarize_scope(scope)` | Generate a full snapshot: memories + facts + loops + latest summary |
+| `save_summary(summary, decisions, facts_learned, open_loops, refs, next_steps)` | Save a structured session handoff document |
+| `run_maintenance()` | Cleanup old memories, trim summaries, dedup, VACUUM |
 
 ---
 
@@ -123,9 +132,11 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CRAFT_MEMORY_TRANSPORT` | `stdio` | Transport mode: `http` or `stdio` |
+| `CRAFT_MEMORY_TRANSPORT` | `http` | Transport mode: `http` or `stdio` |
 | `CRAFT_MEMORY_HOST` | `127.0.0.1` | HTTP server bind address |
 | `CRAFT_MEMORY_PORT` | `8392` | HTTP server port |
+| `CRAFT_MEMORY_DB_DIR` | `~/.craft-agent/memory` | Directory for database files |
+| `CRAFT_MEMORY_DECAY_LAMBDA` | `0.005` | Importance decay rate λ (higher = faster decay) |
 | `CRAFT_WORKSPACE_ID` | `default` | Workspace ID (determines which `.db` file to use) |
 | `CRAFT_SESSION_ID` | `session_{timestamp}` | Session ID injected by Craft Agents |
 | `CRAFT_MEMORY_HOME` | `~/craft-memory` | Path to the craft-memory installation |
@@ -158,10 +169,10 @@ The MCP source connects to `http://localhost:8392/mcp`.
 ### stdio
 
 ```bash
-craft-memory serve  # default transport
+CRAFT_MEMORY_TRANSPORT=stdio craft-memory serve
 ```
 
-Use stdio for local testing or on macOS/Linux where stdio works reliably.
+Use stdio for local testing or when HTTP is not needed. Note: on Windows, the MCP stdio transport may disconnect after a few seconds due to a known SDK issue — HTTP is preferred.
 
 ---
 
@@ -196,9 +207,10 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 7 tools, health check
-│   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup)
-│   │   ├── schema.sql       # 5 tables + FTS virtual table
+│   │   ├── server.py        # FastMCP server, 12 tools, health check
+│   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
+│   │   ├── schema.sql       # 5 tables + FTS virtual table + triggers
+│   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -210,8 +222,8 @@ craft-memory/
 │   ├── memory-maintenance/
 │   └── session-handoff/
 ├── docs/
-│   └── adr/                 # Architecture Decision Records
-├── tests/                   # pytest suite (Phase 5)
+│   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
+├── tests/                   # pytest suite
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```
