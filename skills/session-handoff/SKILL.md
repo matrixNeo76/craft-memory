@@ -57,9 +57,30 @@ remember(content="OPEN LOOP: [what needs doing] — Context: [why it matters]", 
 
 ### Step 5: Generate Summary
 
-Call `summarize_scope(scope="workspace")` to generate a comprehensive snapshot.
+Call `save_summary(summary="...", decisions=[...], facts_learned=[...], open_loops=[...], next_steps="...")` to save the structured handoff document. Note the returned `summary_id`.
 
-### Step 6: Present Handoff to User
+### Step 6: Rate This Session
+
+After saving the summary, evaluate the session quality:
+
+```
+rate_session(
+  summary_id=[id from step 5],
+  score=[0.0-1.0],
+  notes="[optional: what made this session good/bad]"
+)
+```
+
+**Score guide**:
+- `0.9–1.0` — Excellent: major progress, clean decisions, no wasted effort
+- `0.7–0.8` — Good: solid work, minor ambiguities
+- `0.5–0.6` — Mixed: some useful output but significant rework or errors
+- `0.3–0.4` — Poor: mostly off-track, needed heavy correction
+- `0.0–0.2` — Failed: session produced no lasting value
+
+High-quality sessions (score >= 0.7) become retrievable via `get_high_quality_sessions()` and exportable as training traces via `export_session_traces()`.
+
+### Step 7: Present Handoff to User
 
 Show the user a compact summary:
 
@@ -98,7 +119,8 @@ When switching model or provider, ensure:
 - [ ] All decisions are stored as memories (category: decision)
 - [ ] All stable knowledge is stored as facts
 - [ ] Open loops are listed and prioritized
-- [ ] A summary has been generated via `summarize_scope`
+- [ ] Summary saved via `save_summary()` (note the returned summary_id)
+- [ ] Session rated via `rate_session(summary_id, score)` (0.0–1.0)
 - [ ] The user has seen the handoff summary
 
 The NEXT session (with the new model) will automatically recover this context via the SessionStart automation and the memory-protocol skill.

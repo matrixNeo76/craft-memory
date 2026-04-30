@@ -110,6 +110,11 @@ from craft_memory_mcp.db import (
     get_procedure_outcomes as _db_get_procedure_outcomes,
     get_graph_context as _db_get_graph_context,
     batch_remember as _db_batch_remember,
+    get_top_procedures as _db_get_top_procedures,
+    consolidate_memories as _db_consolidate_memories,
+    rate_session as _db_rate_session,
+    get_high_quality_sessions as _db_get_high_quality_sessions,
+    export_session_traces as _db_export_session_traces,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -183,6 +188,56 @@ async def health_check(request):
         "db_size_mb": db_size_mb,
         "db_size_warning": db_size_mb > 100,
     })
+
+
+# ─── Prometheus-compatible metrics endpoint (HTTP transport only) ─────
+
+@mcp.custom_route("/metrics", methods=["GET"])
+async def metrics(request):
+    """Prometheus-compatible metrics endpoint.
+
+    Exposes memory, procedure, open loop, and DB size counters.
+    Useful for Grafana dashboards and external monitoring without MCP calls.
+    """
+    from starlette.responses import PlainTextResponse
+    ws = WORKSPACE_ID
+    lines = [f'# HELP craft_memory_info Craft Memory server info\n# TYPE craft_memory_info gauge\nccraft_memory_info{{version="{_VERSION}",workspace="{ws}"}} 1']
+    try:
+        conn = _get_conn()
+        stats = _db_get_memory_stats(conn, ws)
+
+        mem_total = stats.get("total_memories", 0)
+        core_total = stats.get("core_memories", 0)
+        facts_total = stats.get("total_facts", 0)
+        loops_total = stats.get("open_loops", 0)
+        proc_total = stats.get("total_procedures", 0)
+
+        avg_conf_row = conn.execute(
+            "SELECT AVG(confidence) AS avg_conf FROM procedures WHERE workspace_id = ? AND status = 'active'",
+            (ws,),
+        ).fetchone()
+        avg_conf = round(avg_conf_row["avg_conf"] or 0.0, 4)
+
+        db_dir = Path(os.environ.get("CRAFT_MEMORY_DB_DIR", str(Path.home() / ".craft-agent/memory")))
+        db_path = db_dir / f"{ws}.db"
+        db_size_mb = round(db_path.stat().st_size / 1024 / 1024, 4) if db_path.exists() else 0.0
+
+        def _gauge(name: str, help_text: str, value) -> str:
+            return f"# HELP {name} {help_text}\n# TYPE {name} gauge\n{name}{{workspace=\"{ws}\"}} {value}"
+
+        lines += [
+            _gauge("craft_memory_memories_total", "Total memories stored", mem_total),
+            _gauge("craft_memory_core_memories_total", "Core memories (decay-immune)", core_total),
+            _gauge("craft_memory_facts_total", "Total stable facts", facts_total),
+            _gauge("craft_memory_open_loops_total", "Open loops count", loops_total),
+            _gauge("craft_memory_procedures_total", "Active procedures count", proc_total),
+            _gauge("craft_memory_procedure_confidence_avg", "Average active procedure confidence", avg_conf),
+            _gauge("craft_memory_db_size_mb", "Database size in megabytes", db_size_mb),
+        ]
+    except Exception as exc:
+        lines.append(f"# ERROR collecting metrics: {exc}")
+
+    return PlainTextResponse("\n\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 # Global connection (one per server instance)
@@ -1424,12 +1479,126 @@ def batch_remember(entries_json: str) -> str:
     return chr(10).join(parts)
 
 
+# ─── Sprint 8: Procedure Intelligence + Session Quality ──────────────
+
+@mcp.tool()
+def top_procedures(limit: int = 10) -> str:
+    """Return top procedures ranked by confidence × success_rate × use_count.
+
+    Simmetrico di god_facts per le procedure. Mostra quali procedure sono più
+    efficaci in base agli outcome registrati. Solo procedure active.
+    Returns JSON array with name, confidence, success_rate, use_count, top_score.
+    """
+    conn = _get_conn()
+    results = _db_get_top_procedures(conn, WORKSPACE_ID, limit=limit)
+    if not results:
+        return "No active procedures found in workspace."
+    return json.dumps(results, default=str, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def consolidate_memories(
+    candidate_ids_json: str,
+    procedure_name: str,
+    trigger_context: str,
+    steps_md: str,
+    confirm: bool = False,
+) -> str:
+    """Combine old memories into a procedure and optionally invalidate the originals.
+
+    candidate_ids_json: JSON array of memory IDs to consolidate, e.g. "[3, 7, 12]"
+    procedure_name: name for the new (or updated) procedure
+    trigger_context: when this procedure should be triggered
+    steps_md: markdown steps for the procedure
+    confirm: if False (default) → dry-run, no changes made
+             if True → creates procedure and marks memories as invalidated
+
+    Safe by default: memories are marked lifecycle_status='invalidated', not deleted.
+    Use approve_memory() to reverse if needed.
+    """
+    conn = _get_conn()
+    try:
+        candidate_ids = json.loads(candidate_ids_json)
+        if not isinstance(candidate_ids, list):
+            return "Error: candidate_ids_json must be a JSON array of integers."
+    except (json.JSONDecodeError, ValueError) as exc:
+        return f"Error: invalid JSON — {exc}"
+
+    result = _db_consolidate_memories(
+        conn, candidate_ids, WORKSPACE_ID,
+        procedure_name=procedure_name,
+        trigger_context=trigger_context,
+        steps_md=steps_md,
+        confirm=confirm,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def rate_session(summary_id: int, score: float, notes: str = "") -> str:
+    """Assign a quality score (0.0–1.0) to a session summary.
+
+    Use at the end of a session to mark how useful, correct, and productive
+    the session was. High-quality sessions (score >= 0.7) are retrievable
+    via get_high_quality_sessions and exportable as training traces.
+
+    score: float between 0.0 (poor) and 1.0 (excellent)
+    notes: optional free-text explanation of the rating
+    """
+    conn = _get_conn()
+    ok = _db_rate_session(conn, summary_id, WORKSPACE_ID, score, notes=notes or None)
+    if not ok:
+        return f"Error: session summary #{summary_id} not found in workspace."
+    return f"Session #{summary_id} rated {score:.2f}." + (f" Notes: {notes}" if notes else "")
+
+
+# ─── Sprint 9: SessionDB Foundation ──────────────────────────────────
+
+@mcp.tool()
+def get_high_quality_sessions(min_score: float = 0.7, limit: int = 10) -> str:
+    """Return session summaries with quality_score >= min_score.
+
+    Use to retrieve your best sessions as positive examples for self-improvement,
+    fine-tuning, or eval dataset construction (Hermes-style GEPA).
+    Sessions without a quality score are excluded.
+
+    Returns JSON array ordered by quality_score descending.
+    """
+    conn = _get_conn()
+    results = _db_get_high_quality_sessions(conn, WORKSPACE_ID, min_score=min_score, limit=limit)
+    if not results:
+        return f"No sessions found with quality_score >= {min_score}."
+    return json.dumps(results, default=str, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def export_session_traces(min_score: float = 0.0, limit: int = 50) -> str:
+    """Export session summaries as JSONL for training, eval, or analysis.
+
+    Each line is a JSON object with: id, session_id, summary, decisions,
+    quality_score, quality_notes, created_at.
+    min_score=0.0 includes all rated sessions; raise it to filter top sessions only.
+    Unrated sessions (NULL quality_score) are always excluded.
+    limit caps output at N sessions (default 50) to avoid oversized responses.
+    """
+    conn = _get_conn()
+    output = _db_export_session_traces(
+        conn, WORKSPACE_ID,
+        min_score=min_score if min_score > 0.0 else None,
+        limit=limit,
+    )
+    if not output:
+        return "No rated sessions found. Use rate_session() to score sessions first."
+    return output
+
+
 def run_server():
     """Start the MCP server with the configured transport."""
     if MCP_TRANSPORT == "http":
         import uvicorn
         print(f"[craft-memory] v{_VERSION} HTTP server on http://{MCP_HOST}:{MCP_PORT}/mcp", flush=True)
         print(f"[craft-memory] Health: http://{MCP_HOST}:{MCP_PORT}/health", flush=True)
+        print(f"[craft-memory] Metrics: http://{MCP_HOST}:{MCP_PORT}/metrics", flush=True)
         print(f"[craft-memory] Workspace: {WORKSPACE_ID}", flush=True)
         app = mcp.streamable_http_app()
         uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)

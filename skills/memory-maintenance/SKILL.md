@@ -32,18 +32,50 @@ Review the output. Look for:
 
 ### Step 2: Consolidate Redundant Memories
 
-If you find multiple memories about the same topic, create ONE consolidated memory and note the originals:
+Use the built-in consolidation pipeline:
 
+**2a. Find candidates** (memories that have become low-value):
 ```
-remember(
-  content="Consolidated: [merged content from multiple memories]",
-  category="note",
-  importance=[max of originals],
-  scope="workspace"
+consolidation_candidates(importance_threshold=2.0, age_days=30)
+```
+Returns old, non-core memories with low effective importance. Review the list.
+
+**2b. Dry-run the consolidation** (no changes):
+```
+consolidate_memories(
+  candidate_ids_json="[id1, id2, id3]",
+  procedure_name="[descriptive_name]",
+  trigger_context="[when this knowledge is relevant]",
+  steps_md="## Summary\n[synthesized content]",
+  confirm=False
 )
 ```
+Review what would be created and invalidated.
 
-Then note in your response which memories could be removed (manual review recommended).
+**2c. Confirm if the plan looks right**:
+```
+consolidate_memories(
+  candidate_ids_json="[id1, id2, id3]",
+  procedure_name="[descriptive_name]",
+  trigger_context="[when this knowledge is relevant]",
+  steps_md="## Summary\n[synthesized content]",
+  confirm=True
+)
+```
+This creates the procedure and marks all candidate memories as `invalidated`.
+Memories are NOT deleted — use `approve_memory(id)` to reverse if needed.
+
+### Step 2b: Review Procedure Performance
+
+Check which procedures are actually working:
+```
+top_procedures(limit=10)
+```
+Returns procedures ranked by `confidence × success_rate × use_count`.
+
+For low-confidence procedures with many failures, consider:
+- Updating steps with `save_procedure()` (upsert by name)
+- Deprecating with `save_procedure(..., status="deprecated")`
 
 ### Step 3: Promote Stable Knowledge to Facts
 
@@ -77,16 +109,18 @@ Present a maintenance report:
 ```
 🧹 Memory Maintenance Report
 
-Consolidated: [N] memories merged into [M]
+Consolidated: [N] memories → [M] procedures created
 Facts promoted: [N] new facts from memories
 Loops closed: [N] resolved
 Loops flagged stale: [N]
 Facts updated: [N]
+Procedures updated: [N] (confidence evolved from outcomes)
 
 Current stats:
-  Memories: [total]
+  Memories: [total] (core: [N], active: [N], invalidated: [N])
   Facts: [total]
   Open loops: [total]
+  Procedures: [total] (top: [name] at [score])
 ```
 
 ## Maintenance Principles

@@ -2019,3 +2019,195 @@ def batch_remember(
         )
         results.append(mid)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Sprint 8 — Procedure Intelligence + Session Quality
+# ---------------------------------------------------------------------------
+
+def get_top_procedures(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return top procedures ranked by confidence × success_rate × use_count.
+
+    Simmetrico di god_facts per le procedure. Procedure senza outcome hanno
+    use_count=0 e top_score=0.0. Solo procedure con status='active'.
+    """
+    rows = conn.execute(
+        """SELECT
+               p.*,
+               COUNT(po.id)                                           AS use_count,
+               COALESCE(
+                   COUNT(CASE WHEN po.outcome='success' THEN 1 END) * 1.0
+                   / NULLIF(COUNT(po.id), 0),
+                   0.0
+               )                                                      AS success_rate,
+               p.confidence
+               * COALESCE(
+                   COUNT(CASE WHEN po.outcome='success' THEN 1 END) * 1.0
+                   / NULLIF(COUNT(po.id), 0),
+                   0.0
+               )
+               * COUNT(po.id)                                         AS top_score
+           FROM procedures p
+           LEFT JOIN procedure_outcomes po
+               ON po.procedure_id = p.id AND po.workspace_id = ?
+           WHERE p.workspace_id = ? AND p.status = 'active'
+           GROUP BY p.id
+           ORDER BY top_score DESC, p.confidence DESC
+           LIMIT ?""",
+        (workspace_id, workspace_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def consolidate_memories(
+    conn: sqlite3.Connection,
+    candidate_ids: list[int],
+    workspace_id: str,
+    procedure_name: str,
+    trigger_context: str,
+    steps_md: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Combine consolidation candidates into a procedure and invalidate originals.
+
+    With confirm=False (default) performs a dry-run: returns what would happen
+    without modifying the database.
+    With confirm=True: creates the procedure via save_procedure and marks each
+    candidate memory as 'invalidated' via invalidate_memory.
+
+    Returns:
+      dry_run          — whether this was a dry-run
+      procedure_name   — name that was/would be used
+      candidate_count  — number of valid candidate IDs found
+      procedure_id     — id of created procedure (None on dry-run)
+      invalidated_count — number of memories actually invalidated (0 on dry-run)
+    """
+    valid_ids = []
+    for mid in candidate_ids:
+        row = conn.execute(
+            "SELECT id FROM memories WHERE id = ? AND workspace_id = ?",
+            (mid, workspace_id),
+        ).fetchone()
+        if row:
+            valid_ids.append(mid)
+
+    if not confirm:
+        return {
+            "dry_run": True,
+            "procedure_name": procedure_name,
+            "candidate_count": len(valid_ids),
+            "procedure_id": None,
+            "invalidated_count": 0,
+        }
+
+    proc_id = save_procedure(
+        conn, workspace_id, procedure_name, trigger_context, steps_md,
+        source_memory_ids=valid_ids or None,
+    )
+    invalidated = 0
+    for mid in valid_ids:
+        ok = invalidate_memory(conn, mid, f"consolidated into procedure '{procedure_name}'", workspace_id)
+        if ok:
+            invalidated += 1
+
+    return {
+        "dry_run": False,
+        "procedure_name": procedure_name,
+        "candidate_count": len(valid_ids),
+        "procedure_id": proc_id,
+        "invalidated_count": invalidated,
+    }
+
+
+def rate_session(
+    conn: sqlite3.Connection,
+    summary_id: int,
+    workspace_id: str,
+    score: float,
+    notes: str | None = None,
+) -> bool:
+    """Set quality_score (and optionally quality_notes) on a session summary.
+
+    Returns True if the summary was found and updated, False otherwise.
+    score must be in [0.0, 1.0].
+    """
+    row = conn.execute(
+        "SELECT id FROM session_summaries WHERE id = ? AND workspace_id = ?",
+        (summary_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "UPDATE session_summaries SET quality_score = ?, quality_notes = ? WHERE id = ?",
+        (score, notes, summary_id),
+    )
+    conn.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Sprint 9 — SessionDB Foundation
+# ---------------------------------------------------------------------------
+
+def get_high_quality_sessions(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    min_score: float = 0.7,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return session summaries with quality_score >= min_score, ordered by score desc.
+
+    Sessions with NULL quality_score are excluded. Workspace-isolated.
+    """
+    rows = conn.execute(
+        """SELECT id, session_id, summary, decisions, quality_score, quality_notes, created_at
+           FROM session_summaries
+           WHERE workspace_id = ? AND quality_score >= ?
+           ORDER BY quality_score DESC, created_at_epoch DESC
+           LIMIT ?""",
+        (workspace_id, min_score, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def export_session_traces(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    min_score: float | None = None,
+    limit: int = 50,
+) -> str:
+    """Export session summaries as JSONL (one JSON object per line).
+
+    Each line includes: id, session_id, summary, decisions, quality_score,
+    quality_notes, created_at.
+    min_score=None includes all scored sessions; unscored (NULL) are excluded.
+    Returns empty string when no sessions match.
+    """
+    params: list[Any]
+    if min_score is not None:
+        rows = conn.execute(
+            """SELECT id, session_id, summary, decisions, quality_score, quality_notes, created_at
+               FROM session_summaries
+               WHERE workspace_id = ? AND quality_score >= ?
+               ORDER BY quality_score DESC, created_at_epoch DESC
+               LIMIT ?""",
+            (workspace_id, min_score, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, session_id, summary, decisions, quality_score, quality_notes, created_at
+               FROM session_summaries
+               WHERE workspace_id = ? AND quality_score IS NOT NULL
+               ORDER BY quality_score DESC, created_at_epoch DESC
+               LIMIT ?""",
+            (workspace_id, limit),
+        ).fetchall()
+
+    if not rows:
+        return ""
+    lines = [json.dumps(dict(r), default=str, ensure_ascii=False) for r in rows]
+    return "\n".join(lines)

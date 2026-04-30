@@ -20,6 +20,27 @@ When a new session begins, you MUST execute this sequence BEFORE doing any other
 Example opening:
 > "I recovered context from your previous sessions. Here's what I found: [summary]. There are N open loops: [list]."
 
+## Decision Tree: Which Storage Tool to Use?
+
+```
+Something happened in this session (event, decision, fix, discovery)?
+  └── ONE item → remember()
+  └── MANY items at once (session end, bulk) → batch_remember()
+
+You have confirmed, stable knowledge that won't change?
+  └── → upsert_fact()
+
+You have a repeatable multi-step workflow for a trigger?
+  └── → save_procedure()
+
+Not sure which category? → classify_event(content)
+  Returns: DISCARD / EPISODIC / FACT_CANDIDATE / OPEN_LOOP / PROCEDURE_CANDIDATE / CORE_CANDIDATE
+```
+
+**Anti-pattern trap**: Do NOT use `remember()` for stable facts — they decay over time.
+Do NOT use `upsert_fact()` for one-off events — you lose the temporal context.
+Do NOT use `save_procedure()` for a single past event — procedures describe recurring workflows.
+
 ## When to Use `remember`
 
 Store a memory ONLY when it has real, lasting value:
@@ -88,6 +109,51 @@ Use search when:
 - You want to check if something was tried before
 - You need to recover context about a specific topic
 
+## When to Use `save_procedure`
+
+Use when you discover a **repeatable multi-step workflow**:
+
+```
+save_procedure(
+  name="deploy_staging",
+  trigger_context="when asked to deploy to staging",
+  steps_md="## Steps\n1. Run tests\n2. Build Docker image\n3. Push to registry\n4. Apply k8s manifest",
+  confidence=0.8
+)
+```
+
+After executing a procedure, record the result:
+- `record_procedure_outcome(procedure_id, outcome="success")` — it was effective
+- `record_procedure_outcome(procedure_id, outcome="partial")` — partially worked
+- `record_procedure_outcome(procedure_id, outcome="failure", notes="step 3 failed due to X")` — it failed
+
+This evolves procedure confidence automatically via daily maintenance.
+
+## When to Use `batch_remember`
+
+Use at session end or when saving multiple related memories to reduce MCP round-trips:
+
+```json
+[
+  {"content": "Fixed auth bug — root cause: missing await", "category": "bugfix", "importance": 8},
+  {"content": "API uses JWT with 1h expiry", "category": "discovery", "importance": 7},
+  {"content": "Deployed v1.3.2 to production successfully", "category": "change", "importance": 6}
+]
+```
+
+Duplicates are silently skipped (return `null` for that slot).
+
+## Retrieval: Coarse-to-Fine Pattern
+
+When you need deep context on a topic, escalate through the 3 layers:
+
+1. **Layer 1 — Find** (fast): `search_memory(query, limit=5)` → get relevant snippet IDs
+2. **Layer 2 — Context** (medium): `get_relations(memory_id)` → expand via knowledge graph
+3. **Layer 3 — Detail** (precise): `get_memory_bundle([id1, id2, ...])` → fetch full rows
+4. **Layer 4 — Neighborhood** (deep): `get_graph_context(memory_id, depth=2)` → BFS multi-hop
+
+Don't skip to Layer 4 directly — it's expensive. Use it only after Layer 1-2 identify the anchor.
+
 ## Anti-Patterns to Avoid
 
 1. **Memory spam**: Don't remember every single action or message
@@ -95,3 +161,5 @@ Use search when:
 3. **Orphan loops**: Don't create loops you never intend to close
 4. **Ignoring context**: Don't skip the session start sequence
 5. **Duplicate content**: The system auto-deduplicates, but try to be concise
+6. **Using remember() for procedures**: If you find yourself writing the same steps in multiple memories, that's a procedure
+7. **Skipping outcome tracking**: Always call `record_procedure_outcome` after executing a procedure

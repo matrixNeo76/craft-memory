@@ -50,10 +50,25 @@ Call `get_recent_memory(limit=1)` to confirm the MCP connection works end-to-end
 ## Server Details
 
 - **Endpoint**: `http://127.0.0.1:8392/mcp`
-- **Health check**: `http://127.0.0.1:8392/health`
+- **Health check**: `http://127.0.0.1:8392/health` → JSON: status, db, version, db_size_mb
+- **Metrics**: `http://127.0.0.1:8392/metrics` → Prometheus text format (memories, facts, loops, procedures, confidence avg, db size)
 - **Transport**: HTTP Streamable (FastMCP 1.26.0)
 - **Process**: Runs detached in background, survives shell closure
 - **Data**: `~/.craft-agent/memory/{workspaceId}.db`
+
+## Quick Diagnostics (via MCP tools)
+
+```
+memory_stats()              # aggregate counts for this workspace
+god_facts(top_n=5)          # most impactful facts
+top_procedures(limit=5)     # best performing procedures
+list_open_loops()           # pending tasks
+```
+
+To check DB-level metrics without MCP (curl or browser):
+```bash
+curl http://127.0.0.1:8392/metrics
+```
 
 ## Troubleshooting
 
