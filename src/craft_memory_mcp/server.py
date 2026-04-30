@@ -81,6 +81,7 @@ from craft_memory_mcp.db import (
     search_memory as _db_search_memory,
     summarize_scope as _db_summarize_scope,
     update_memory as _db_update_memory,
+    update_open_loop as _db_update_open_loop,
     upsert_fact as _db_upsert_fact,
 )
 
@@ -395,6 +396,42 @@ def add_open_loop(
         title, description, priority, scope, CRAFT_SESSION_ID,
     )
     return f"Open loop #{loop_id} created: [{priority}] {title}"
+
+
+# ─── Tool: update_open_loop ──────────────────────────────────────────
+
+@mcp.tool()
+def update_open_loop(
+    id: int,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+) -> str:
+    """Update title, description, priority or status of an open loop.
+
+    Args:
+        id: Loop ID to update
+        title: New title (optional)
+        description: New description (optional)
+        priority: low | medium | high | critical (optional)
+        status: open | in_progress | closed | stale (optional)
+
+    Returns:
+        Confirmation or not-found notice
+    """
+    conn = _get_conn()
+    ok = _db_update_open_loop(conn, id, WORKSPACE_ID, title=title, description=description, priority=priority, status=status)
+    if ok:
+        parts = [f"Loop #{id} updated."]
+        if title:
+            parts.append(f"Title: {title}")
+        if priority:
+            parts.append(f"Priority: {priority}")
+        if status:
+            parts.append(f"Status: {status}")
+        return " ".join(parts)
+    return f"Loop #{id} not found or no valid fields to update."
 
 
 # ─── Tool: summarize_scope ───────────────────────────────────────────

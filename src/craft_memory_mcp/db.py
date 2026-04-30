@@ -438,6 +438,51 @@ def close_open_loop(
     return cursor.rowcount > 0
 
 
+def update_open_loop(
+    conn: sqlite3.Connection,
+    loop_id: int,
+    workspace_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+) -> bool:
+    """Update mutable fields of an open loop. Returns True if updated."""
+    valid_priorities = {"low", "medium", "high", "critical"}
+    valid_statuses = {"open", "in_progress", "closed", "stale"}
+
+    if priority and priority not in valid_priorities:
+        return False
+    if status and status not in valid_statuses:
+        return False
+
+    sets: list[str] = []
+    params: list[Any] = []
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+    if description is not None:
+        sets.append("description = ?")
+        params.append(description)
+    if priority is not None:
+        sets.append("priority = ?")
+        params.append(priority)
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+
+    if not sets:
+        return False
+
+    params.extend([loop_id, workspace_id])
+    cursor = conn.execute(
+        f"UPDATE open_loops SET {', '.join(sets)} WHERE id = ? AND workspace_id = ?",
+        params,
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 # ─── Session Summaries CRUD ──────────────────────────────────────────
 
 def save_summary(

@@ -11,6 +11,7 @@ from craft_memory_mcp.db import (
     register_session,
     remember,
     search_memory,
+    update_open_loop,
     upsert_fact,
 )
 
@@ -246,3 +247,34 @@ def test_close_open_loop_idempotent(registered_conn):
     second = close_open_loop(registered_conn, loop_id)
 
     assert second is False
+
+
+def test_update_open_loop_priority(registered_conn):
+    """update_open_loop changes priority correctly."""
+    loop_id = create_open_loop(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID, "Test task")
+    ok = update_open_loop(registered_conn, loop_id, TEST_WORKSPACE_ID, priority="high")
+    assert ok is True
+    row = registered_conn.execute(
+        "SELECT priority FROM open_loops WHERE id = ?", (loop_id,)
+    ).fetchone()
+    assert row["priority"] == "high"
+
+
+def test_update_open_loop_status_to_in_progress(registered_conn):
+    """update_open_loop can move a loop to in_progress without closing it."""
+    loop_id = create_open_loop(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID, "WIP task")
+    ok = update_open_loop(registered_conn, loop_id, TEST_WORKSPACE_ID, status="in_progress")
+    assert ok is True
+    loops = list_open_loops(registered_conn, TEST_WORKSPACE_ID, status="in_progress")
+    assert any(l["id"] == loop_id for l in loops)
+
+
+def test_update_open_loop_invalid_priority_rejected(registered_conn):
+    """update_open_loop rejects unknown priority values."""
+    loop_id = create_open_loop(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID, "Task")
+    ok = update_open_loop(registered_conn, loop_id, TEST_WORKSPACE_ID, priority="urgent")
+    assert ok is False
+    row = registered_conn.execute(
+        "SELECT priority FROM open_loops WHERE id = ?", (loop_id,)
+    ).fetchone()
+    assert row["priority"] == "medium"  # unchanged
