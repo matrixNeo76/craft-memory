@@ -52,8 +52,10 @@ _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _DECAY_LAMBDA = float(os.environ.get("CRAFT_MEMORY_DECAY_LAMBDA", "0.005"))
 
 
-def _effective_importance(importance: int, created_at_epoch: int) -> float:
-    """Time-decayed importance score. Older memories score progressively lower."""
+def _effective_importance(importance: int, created_at_epoch: int, is_core: bool = False) -> float:
+    """Time-decayed importance score. Core memories are immune to decay."""
+    if is_core:
+        return float(importance)
     age_days = (_now_epoch() - created_at_epoch) / 86400
     return importance * math.exp(-_DECAY_LAMBDA * age_days)
 
@@ -369,7 +371,7 @@ def get_recent_memory(
 
     scored = sorted(
         [dict(r) for r in rows],
-        key=lambda m: _effective_importance(m["importance"], m["created_at_epoch"]),
+        key=lambda m: _effective_importance(m["importance"], m["created_at_epoch"], bool(m.get("is_core", 0))),
         reverse=True,
     )
 
@@ -805,6 +807,61 @@ def daily_maintenance(
         "trimmed_summaries": trimmed,
         "deduped_memories": deduped,
     }
+
+
+def promote_memory_to_core(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+) -> bool:
+    """Mark a memory as core (immune to importance decay). Returns True if updated."""
+    cursor = conn.execute(
+        "UPDATE memories SET is_core = 1 WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def demote_memory_from_core(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+) -> bool:
+    """Remove core flag from a memory. Returns True if updated."""
+    cursor = conn.execute(
+        "UPDATE memories SET is_core = 0 WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def find_consolidation_candidates(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    importance_threshold: float = 2.0,
+    age_days: int = 30,
+) -> list[dict[str, Any]]:
+    """Find old memories with low effective importance — candidates for consolidation."""
+    cutoff_epoch = _now_epoch() - (age_days * 86400)
+    now_epoch = _now_epoch()
+    rows = conn.execute(
+        """SELECT * FROM (
+               SELECT *,
+                   importance * EXP(:lam * (:now - created_at_epoch) / -86400.0) AS effective_importance
+               FROM memories
+               WHERE workspace_id = :ws
+               AND is_core = 0
+               AND created_at_epoch < :cutoff
+           )
+           WHERE effective_importance < :threshold
+           ORDER BY effective_importance ASC
+           LIMIT 50""",
+        {"ws": workspace_id, "now": now_epoch, "cutoff": cutoff_epoch,
+         "threshold": importance_threshold, "lam": _DECAY_LAMBDA},
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def search_by_tag(

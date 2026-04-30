@@ -3,12 +3,16 @@ import pytest
 from constants import TEST_SESSION_ID, TEST_WORKSPACE_ID
 
 from craft_memory_mcp.db import (
+    _effective_importance,
     close_open_loop,
     create_open_loop,
+    demote_memory_from_core,
+    find_consolidation_candidates,
     get_facts,
     get_recent_memory,
     hybrid_search,
     list_open_loops,
+    promote_memory_to_core,
     register_session,
     remember,
     search_memory,
@@ -333,3 +337,49 @@ def test_rrf_score_combines_ranks():
     # id=2 appears in both — must have the highest combined score
     assert scores[2] > scores[1]
     assert scores[2] > scores[3]
+
+
+# ─── Core Memory Promotion ───────────────────────────────────────────
+
+
+def test_promote_to_core_sets_flag(registered_conn):
+    """promote_memory_to_core sets is_core=1 on the memory."""
+    mem_id = remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+                      "Critical architectural decision", "decision", importance=9)
+    ok = promote_memory_to_core(registered_conn, mem_id, TEST_WORKSPACE_ID)
+    assert ok is True
+    row = registered_conn.execute(
+        "SELECT is_core FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["is_core"] == 1
+
+
+def test_core_memory_no_decay(registered_conn):
+    """Core memory effective_importance equals base importance (no decay)."""
+    score_normal = _effective_importance(8, 0, is_core=False)  # very old
+    score_core = _effective_importance(8, 0, is_core=True)
+    assert score_core == 8.0
+    assert score_core > score_normal
+
+
+def test_core_memory_not_in_consolidation_candidates(registered_conn):
+    """Core memories must not appear in find_consolidation_candidates."""
+    mem_id = remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+                      "Core architectural decision", "decision", importance=2)
+    promote_memory_to_core(registered_conn, mem_id, TEST_WORKSPACE_ID)
+    candidates = find_consolidation_candidates(registered_conn, TEST_WORKSPACE_ID,
+                                               importance_threshold=10.0, age_days=0)
+    assert all(c["id"] != mem_id for c in candidates)
+
+
+def test_demote_memory_from_core(registered_conn):
+    """demote_memory_from_core removes the is_core flag."""
+    mem_id = remember(registered_conn, TEST_SESSION_ID, TEST_WORKSPACE_ID,
+                      "Demotable memory", "note", importance=7)
+    promote_memory_to_core(registered_conn, mem_id, TEST_WORKSPACE_ID)
+    ok = demote_memory_from_core(registered_conn, mem_id, TEST_WORKSPACE_ID)
+    assert ok is True
+    row = registered_conn.execute(
+        "SELECT is_core FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["is_core"] == 0

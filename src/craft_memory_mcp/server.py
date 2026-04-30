@@ -62,9 +62,11 @@ from craft_memory_mcp.db import (
     daily_maintenance as _db_daily_maintenance,
     dedup_memories as _db_dedup_memories,
     delete_old_memories as _db_delete_old_memories,
+    find_consolidation_candidates as _db_find_consolidation_candidates,
     find_similar_memories as _db_find_similar_memories,
     get_connection as _db_get_connection,
     hybrid_search as _db_hybrid_search,
+    promote_memory_to_core as _db_promote_memory_to_core,
     get_facts as _db_get_facts,
     get_latest_summary as _db_get_latest_summary,
     get_recent_memory as _db_get_recent_memory,
@@ -598,6 +600,29 @@ def run_maintenance() -> str:
         f"trimmed_summaries={result['trimmed_summaries']}, "
         f"deduped_memories={result['deduped_memories']}"
     )
+
+
+# ─── Tool: promote_to_core ──────────────────────────────────────────
+
+@mcp.tool()
+def promote_to_core(
+    id: int,
+) -> str:
+    """Mark a memory as core — immune to importance decay.
+
+    Core memories always rank at full importance regardless of age.
+    Use for architectural decisions, confirmed patterns, or key facts
+    that must always be retrieved.
+
+    Args:
+        id: Memory ID to promote
+
+    Returns:
+        Confirmation or not-found notice
+    """
+    conn = _get_conn()
+    ok = _db_promote_memory_to_core(conn, id, WORKSPACE_ID)
+    return f"Memory #{id} promoted to core." if ok else f"Memory #{id} not found."
 
 
 # ─── Tool: search_by_tag ────────────────────────────────────────────
