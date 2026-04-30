@@ -53,6 +53,20 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 
 ---
 
+## Quick Path
+
+Five tools cover 90% of daily use:
+
+```
+Session start  → get_recent_memory + list_open_loops
+During work    → remember (decisions) + upsert_fact (stable knowledge)
+Search         → search_memory
+```
+
+Everything else — graph relationships, maintenance, diagnostics — is available but optional. Tools are grouped into **core**, **graph**, and **admin** in the [guide](sources/memory/guide.md) and docstrings.
+
+---
+
 ## How It Works
 
 ```
@@ -257,6 +271,21 @@ craft-memory/
 - [Craft Agents](https://craft.do/agents) (pi)
 - FastMCP >= 1.26.0
 - uvicorn >= 0.30.0
+
+---
+
+## Stability-First Mode
+
+This system prioritizes **precision, explainability, and safety** over aggressive automation:
+
+| Concern | Default behavior |
+|---------|-----------------|
+| Graph auto-links | Only created when BM25 score < -2.5 (strict). Configurable via `CRAFT_MEMORY_AUTOLINK_THRESHOLD`. |
+| Inferred edge pruning | Edges with weight < 0.3 AND age > 60d are removed by `run_maintenance`. |
+| Core promotion | Always requires explicit decision. Never runs automatically. |
+| Loop close / fact promotion | Never automatic. Always human or explicit agent instruction. |
+
+After collecting real usage data (via `inferred_edges_pruned` / `auto_links_created` in maintenance logs), thresholds can be relaxed. See [ARCHITECTURE.md §10.3](ARCHITECTURE.md#103-stability-first-mode) for tuning guidance.
 
 ---
 

@@ -110,20 +110,26 @@ mcp = FastMCP(
     "craft-memory",
     stateless_http=True,
     json_response=True,
-    instructions="""Craft Memory System - Persistent cross-session memory.
+    instructions="""Craft Memory — Persistent cross-session memory.
 
-USAGE PROTOCOL:
-1. At session start: call get_recent_memory + list_open_loops to recover context
-2. During work: call remember for important decisions/discoveries, upsert_fact for stable knowledge
-3. At session end: call summarize_scope to create a handoff document
-4. For search: use search_memory for keyword search across all memories
+TOOL GROUPS:
+  CORE (use every session):
+    remember, search_memory, get_recent_memory, upsert_fact, list_open_loops
 
-MEMORY TYPES:
-- memories (episodic): decisions, discoveries, bugfixes, features, refactors, changes, notes
-- facts (stable): persistent project knowledge with confidence scores
-- open_loops: incomplete tasks and follow-ups that carry across sessions
+  GRAPH (knowledge relationships — use when needed):
+    link_memories, get_relations, find_similar, god_facts, memory_diff, search_by_tag
 
-IMPORTANT: Only store what has real value. Avoid noise and trivial entries.""",
+  ADMIN (lifecycle & housekeeping — use sparingly):
+    run_maintenance, promote_to_core, summarize_scope, save_summary,
+    update_memory, add_open_loop, close_open_loop, update_open_loop
+
+RECOMMENDED WORKFLOW:
+  1. Session start  → get_recent_memory + list_open_loops
+  2. During work    → remember for decisions; upsert_fact for confirmed knowledge
+  3. Session end    → summarize_scope for handoff
+
+STABILITY-FIRST: Core promotion and fact promotion are always assisted or manual.
+Close-loop and link_memories are never automatic. Only store what has lasting value.""",
 )
 
 # ─── Health check endpoint (HTTP transport only) ─────────────────────
@@ -362,7 +368,7 @@ def close_open_loop(
     id: int,
     resolution: str | None = None,
 ) -> str:
-    """Close an open loop with an optional resolution.
+    """[admin] Close an open loop with an optional resolution. Never runs automatically.
 
     Args:
         id: Loop ID to close
@@ -387,7 +393,7 @@ def add_open_loop(
     priority: str = "medium",
     scope: str = "workspace",
 ) -> str:
-    """Create a new open loop (incomplete task or follow-up to track across sessions).
+    """[admin] Create a new open loop (incomplete task or follow-up to track across sessions).
 
     Args:
         title: Short title for the loop
@@ -416,7 +422,7 @@ def update_open_loop(
     priority: str | None = None,
     status: str | None = None,
 ) -> str:
-    """Update title, description, priority or status of an open loop.
+    """[admin] Update title, description, priority or status of an open loop.
 
     Args:
         id: Loop ID to update
@@ -448,7 +454,7 @@ def update_open_loop(
 def summarize_scope(
     scope: str = "workspace",
 ) -> str:
-    """Generate a comprehensive summary of a scope. Use at session end for handoff.
+    """[admin] Generate a comprehensive summary of a scope. Use at session end for handoff.
 
     Args:
         scope: Scope to summarize (default: workspace)
@@ -508,7 +514,7 @@ def save_summary(
     refs: list[str] | None = None,
     next_steps: str | None = None,
 ) -> str:
-    """Save a structured session summary (handoff document). Call at session end.
+    """[admin] Save a structured session summary (handoff document). Call at session end.
 
     Args:
         summary: Free-form narrative of what happened this session
@@ -551,7 +557,7 @@ def update_memory(
     category: str | None = None,
     importance: int | None = None,
 ) -> str:
-    """Update an existing memory's content, category, or importance.
+    """[admin] Update an existing memory's content, category, or importance.
 
     Args:
         id: Memory ID to update
@@ -583,7 +589,7 @@ def update_memory(
 
 @mcp.tool()
 def run_maintenance() -> str:
-    """Run database maintenance: cleanup old memories, trim session summaries, VACUUM.
+    """[admin] Run database maintenance: cleanup old memories, trim session summaries, VACUUM.
 
     Deletes memories older than 180 days with importance < 3, marks stale loops,
     keeps only the 20 most recent session summaries, deduplicates, and runs VACUUM.
@@ -608,7 +614,7 @@ def run_maintenance() -> str:
 def promote_to_core(
     id: int,
 ) -> str:
-    """Mark a memory as core — immune to importance decay.
+    """[admin] Mark a memory as core — immune to importance decay. Assisted action: requires explicit decision.
 
     Core memories always rank at full importance regardless of age.
     Use for architectural decisions, confirmed patterns, or key facts
@@ -633,7 +639,7 @@ def search_by_tag(
     scope: str | None = None,
     limit: int = 20,
 ) -> str:
-    """Search memories by tag.
+    """[graph] Search memories by tag.
 
     Args:
         tag: Tag to search for (e.g. "auth", "deploy")
@@ -676,7 +682,7 @@ def link_memories(
     role: str = "context",
     weight: float = 1.0,
 ) -> str:
-    """Create a directed relation between two memories (knowledge graph edge).
+    """[graph] Create a directed relation between two memories (knowledge graph edge). Never automatic — always explicit.
 
     Args:
         source_id: Source memory ID
@@ -709,7 +715,7 @@ def get_relations(
     memory_id: int,
     direction: str = "both",
 ) -> str:
-    """Get all graph relations for a memory (neighbors in the knowledge graph).
+    """[graph] Get all graph relations for a memory (neighbors in the knowledge graph).
 
     Args:
         memory_id: Memory ID to inspect
@@ -740,13 +746,14 @@ def find_similar(
     top_n: int = 5,
     auto_link: bool = False,
 ) -> str:
-    """Find memories similar to a given one using FTS5 BM25 scoring.
+    """[graph] Find memories similar to a given one using FTS5 BM25 scoring.
 
     Args:
         memory_id: Memory ID to find similarities for
         top_n: Max results (default: 5)
         auto_link: If True, automatically create INFERRED 'semantically_similar_to' edges
-                   for strong matches (BM25 score < -1.5)
+                   for very strong matches only (threshold configurable via CRAFT_MEMORY_AUTOLINK_THRESHOLD,
+                   default -2.5 — strict by design, precision over recall)
 
     Returns:
         List of similar memories with similarity scores
@@ -773,7 +780,7 @@ def find_similar(
 def god_facts(
     top_n: int = 10,
 ) -> str:
-    """Return the most impactful facts — core knowledge nodes referenced most in memories.
+    """[graph] Return the most impactful facts — core knowledge nodes referenced most in memories.
 
     Score = confidence × type_bonus × (1 + mention_count × 0.2)
     EXTRACTED > INFERRED > AMBIGUOUS at equal confidence.
@@ -807,7 +814,7 @@ def god_facts(
 def memory_diff(
     since_epoch: int,
 ) -> str:
-    """Return what changed in memory since a given Unix epoch timestamp.
+    """[graph] Return what changed in memory since a given Unix epoch timestamp.
 
     Useful at session start to understand what happened in previous sessions.
     Tip: use int(time.time()) - 86400 for last 24h, or a session's started_at_epoch.

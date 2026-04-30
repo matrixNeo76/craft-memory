@@ -17,6 +17,7 @@
 7. [Resolved Issues and Applied Fixes](#7-resolved-issues-and-applied-fixes)
 8. [Deployment Guide for New Installations](#8-deployment-guide-for-new-installations)
 9. [Reusability Analysis for Craft Agents](#9-reusability-analysis-for-craft-agents)
+10. [Stability-First Design Principles](#10-stability-first-design-principles)
 
 ---
 
@@ -701,6 +702,66 @@ The main value **is not just the MCP server** — it is the **complete pattern**
 - Structured protocol (session start → work → session end)
 
 This pattern is applicable to **any persistent MCP source** (database, knowledge base, project tracker) and could become a reference template for the Craft Agents community.
+
+---
+
+## 10. Stability-First Design Principles
+
+### 10.1 Recommended Tool Groups
+
+Tools are organized into three groups to reduce cognitive load. The **core group** covers 90% of daily use; the other groups are opt-in.
+
+| Group | Tools | When to use |
+|-------|-------|-------------|
+| **core** | `remember`, `search_memory`, `get_recent_memory`, `upsert_fact`, `list_open_loops` | Every session — the default session flow |
+| **graph** | `link_memories`, `get_relations`, `find_similar`, `god_facts`, `memory_diff`, `search_by_tag` | When building or exploring relationships between memories |
+| **admin** | `run_maintenance`, `promote_to_core`, `summarize_scope`, `save_summary`, `update_memory`, `add_open_loop`, `close_open_loop`, `update_open_loop` | Lifecycle management and housekeeping |
+
+Tool docstrings in `server.py` are prefixed with `[graph]` or `[admin]` for non-core tools. Core tools have no prefix — they are the default path.
+
+The `FastMCP.instructions` field also documents the three groups so the agent can apply the right tool at the right time without reading all docstrings.
+
+### 10.2 Maintenance vs Intelligence Boundaries
+
+A key design principle: **conservative operations run automatically; semantic promotions require human or assisted decision**.
+
+| Operation | Automation Level | Trigger |
+|-----------|-----------------|---------|
+| Delete old low-importance memories | **Automatic** | SchedulerTick / `run_maintenance` |
+| Mark stale open loops (>30d) | **Automatic** | SchedulerTick / `run_maintenance` |
+| Trim session summaries (keep 20) | **Automatic** | SchedulerTick / `run_maintenance` |
+| Deduplicate memories | **Automatic** | SchedulerTick / `run_maintenance` |
+| Prune weak inferred graph edges | **Automatic** | SchedulerTick / `run_maintenance` |
+| WAL checkpoint | **Automatic** | Every 100 writes |
+| Find consolidation candidates | **Assisted** | Agent surfaces candidates → human approves |
+| Promote memory to core | **Assisted** | Agent suggests → human or agent with explicit instruction |
+| Promote memory content to stable fact | **Assisted** | Agent suggests → human or agent with explicit instruction |
+| Close open loop | **Never automatic** | Human or explicit agent instruction only |
+| Create manual graph edge (`link_memories`) | **Never automatic** | Human or explicit agent instruction only |
+| Delete specific memories | **Never automatic** | Human explicit instruction only |
+
+**Rationale**:
+- `automatic` operations are **conservative and reversible**: they remove old low-signal data, never high-importance or core content.
+- `assisted` operations **change the semantic meaning** of a memory (immune to decay, elevated to stable fact) — they require a conscious choice.
+- `never-auto` operations are **destructive or high-stakes**: closing a loop or linking memories creates permanent state changes that should be intentional.
+
+### 10.3 Stability-First Mode
+
+In the current phase, the system prioritizes **precision, explainability, and safety** over aggressive automation. This translates to concrete parameter choices:
+
+| Parameter | Default | Rationale |
+|-----------|---------|-----------|
+| `CRAFT_MEMORY_AUTOLINK_THRESHOLD` | `-2.5` | Strict BM25 threshold for auto-links. Only very strong matches get auto-linked. Prevents graph pollution. |
+| `CRAFT_MEMORY_PRUNE_WEIGHT_THRESHOLD` | `0.3` | Inferred edges with weight < 0.3 are pruned. Low-confidence auto-links are cleaned up. |
+| `CRAFT_MEMORY_PRUNE_AGE_DAYS` | `60` | Only prune inferred edges older than 60 days. Gives time for edges to accumulate context before pruning. |
+| `CRAFT_MEMORY_DECAY_LAMBDA` | `0.005` | Slow decay rate. Memories remain retrievable for months. |
+
+All thresholds are tunable via environment variables. The initial defaults favor **fewer, higher-quality automatic edges** over graph density. After collecting real data via maintenance logs (`auto_links_created`, `inferred_edges_pruned`), thresholds can be relaxed (e.g. auto-link to `-2.0`) if the precision/recall tradeoff warrants it.
+
+**How to interpret maintenance logs** (available after Fase C implementation):
+- `inferred_edges_pruned` / `auto_links_created` ratio > 0.5 → threshold may be too loose, tighten to `-3.0`
+- `inferred_edges_pruned` = 0 consistently → threshold may be too strict, relax to `-2.0`
+- Graph density grows unbounded → lower `CRAFT_MEMORY_PRUNE_AGE_DAYS` to `30`
 
 ---
 
