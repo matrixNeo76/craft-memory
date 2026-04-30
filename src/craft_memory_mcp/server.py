@@ -56,6 +56,7 @@ ArgModelBase.model_config["extra"] = "ignore"
 from mcp.server.fastmcp import FastMCP
 
 from craft_memory_mcp.db import (
+    _AUTOLINK_THRESHOLD,
     close_open_loop as _db_close_open_loop,
     complete_session as _db_complete_session,
     create_open_loop as _db_create_open_loop,
@@ -604,7 +605,8 @@ def run_maintenance() -> str:
         f"deleted_memories={result['deleted_memories']}, "
         f"stale_loops={result['stale_loops']}, "
         f"trimmed_summaries={result['trimmed_summaries']}, "
-        f"deduped_memories={result['deduped_memories']}"
+        f"deduped_memories={result['deduped_memories']}, "
+        f"inferred_edges_pruned={result['inferred_edges_pruned']}"
     )
 
 
@@ -763,12 +765,14 @@ def find_similar(
     if not results:
         return f"No similar memories found for #{memory_id}."
 
-    action = " (INFERRED links created for strong matches)" if auto_link else ""
+    linked_count = sum(1 for r in results if r.get("auto_linked"))
+    action = f" ({linked_count} INFERRED links created, threshold={_AUTOLINK_THRESHOLD})" if auto_link else ""
     lines = [f"Similar to #{memory_id}{action} ({len(results)} found):\n"]
     for r in results:
+        link_marker = " [auto-linked]" if r.get("auto_linked") else ""
         lines.append(
             f"#{r['id']} [{r['category']}] importance={r['importance']} "
-            f"similarity={r['similarity_score']}\n"
+            f"similarity={r['similarity_score']}{link_marker}\n"
             f"  {r['content'][:200]}"
         )
     return "\n\n".join(lines)

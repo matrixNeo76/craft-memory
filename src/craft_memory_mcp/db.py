@@ -51,6 +51,13 @@ def _db_path(workspace_id: str) -> Path:
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _DECAY_LAMBDA = float(os.environ.get("CRAFT_MEMORY_DECAY_LAMBDA", "0.005"))
 
+# Graph hygiene: auto-link threshold (BM25 score, negative — more negative = stronger match)
+# Default -2.5: strict, precision over recall. Relax to -2.0 after data collection.
+_AUTOLINK_THRESHOLD = float(os.environ.get("CRAFT_MEMORY_AUTOLINK_THRESHOLD", "-2.5"))
+# Pruning: inferred edges with weight below this AND older than _PRUNE_AGE_DAYS are removed
+_PRUNE_WEIGHT_THRESHOLD = float(os.environ.get("CRAFT_MEMORY_PRUNE_WEIGHT_THRESHOLD", "0.3"))
+_PRUNE_AGE_DAYS = int(os.environ.get("CRAFT_MEMORY_PRUNE_AGE_DAYS", "60"))
+
 
 def _effective_importance(importance: int, created_at_epoch: int, is_core: bool = False) -> float:
     """Time-decayed importance score. Core memories are immune to decay."""
@@ -794,11 +801,19 @@ def daily_maintenance(
     conn: sqlite3.Connection,
     workspace_id: str,
 ) -> dict[str, Any]:
-    """Run all maintenance: cleanup, dedup, trim summaries, VACUUM. Returns stats."""
+    """Run all maintenance: cleanup, dedup, trim summaries, prune inferred edges, VACUUM.
+
+    All operations are conservative (automatic-safe):
+    - Only deletes old low-importance memories
+    - Only marks stale loops, never closes them
+    - Only prunes is_manual=0 edges with weight < _PRUNE_WEIGHT_THRESHOLD and age > _PRUNE_AGE_DAYS
+    Returns stats including inferred_edges_pruned for threshold tuning.
+    """
     deleted_mem = delete_old_memories(conn, workspace_id, days=180, min_importance=3)
     stale_loops = mark_stale_loops(conn, workspace_id, days=30)
     trimmed = trim_session_summaries(conn, workspace_id, keep_last=20)
     deduped = dedup_memories(conn, workspace_id)
+    pruned_edges = prune_inferred_edges(conn, workspace_id)
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.executescript("VACUUM;")
     return {
@@ -806,6 +821,7 @@ def daily_maintenance(
         "stale_loops": stale_loops,
         "trimmed_summaries": trimmed,
         "deduped_memories": deduped,
+        "inferred_edges_pruned": pruned_edges,
     }
 
 
@@ -864,6 +880,31 @@ def find_consolidation_candidates(
     return [dict(r) for r in rows]
 
 
+def prune_inferred_edges(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    weight_threshold: float | None = None,
+    age_days: int | None = None,
+) -> int:
+    """Remove weak, old auto-link edges (is_manual=0).
+
+    Only affects edges where is_manual=0 (auto-created by find_similar).
+    Manual edges (is_manual=1, default) are never touched.
+    Returns count of pruned edges.
+    """
+    wt = weight_threshold if weight_threshold is not None else _PRUNE_WEIGHT_THRESHOLD
+    ad = age_days if age_days is not None else _PRUNE_AGE_DAYS
+    cutoff_epoch = _now_epoch() - (ad * 86400)
+    cursor = conn.execute(
+        """DELETE FROM memory_relations
+           WHERE workspace_id = ? AND is_manual = 0
+           AND weight < ? AND created_at_epoch <= ?""",
+        (workspace_id, wt, cutoff_epoch),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 def search_by_tag(
     conn: sqlite3.Connection,
     tag: str,
@@ -901,8 +942,13 @@ def link_memories(
     confidence_score: float = 1.0,
     role: str = "context",
     weight: float = 1.0,
+    is_manual: bool = True,
 ) -> int | None:
-    """Create a directed relation between two memories. Returns row id or None if duplicate/invalid."""
+    """Create a directed relation between two memories. Returns row id or None if duplicate/invalid.
+
+    is_manual=True (default): manually created edge — never pruned by maintenance.
+    is_manual=False: auto-created edge (e.g. from find_similar) — prunable if weight < threshold and old.
+    """
     valid_relations = {
         "caused_by", "contradicts", "extends",
         "implements", "supersedes", "semantically_similar_to",
@@ -915,10 +961,10 @@ def link_memories(
         cursor = conn.execute(
             """INSERT OR IGNORE INTO memory_relations
                (source_id, target_id, relation, confidence_type, confidence_score,
-                workspace_id, created_at_epoch, role, weight)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                workspace_id, created_at_epoch, role, weight, is_manual)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (source_id, target_id, relation, confidence_type,
-             confidence_score, workspace_id, now_epoch, role, weight),
+             confidence_score, workspace_id, now_epoch, role, weight, 1 if is_manual else 0),
         )
         conn.commit()
         return cursor.lastrowid if cursor.rowcount > 0 else None
@@ -937,7 +983,7 @@ def get_relations(
     if direction in ("out", "both"):
         rows += conn.execute(
             """SELECT mr.id, mr.source_id, mr.target_id, mr.relation,
-                      mr.confidence_type, mr.confidence_score,
+                      mr.confidence_type, mr.confidence_score, mr.is_manual,
                       m.content AS other_content, m.category AS other_category,
                       'out' AS direction
                FROM memory_relations mr JOIN memories m ON mr.target_id = m.id
@@ -947,7 +993,7 @@ def get_relations(
     if direction in ("in", "both"):
         rows += conn.execute(
             """SELECT mr.id, mr.source_id, mr.target_id, mr.relation,
-                      mr.confidence_type, mr.confidence_score,
+                      mr.confidence_type, mr.confidence_score, mr.is_manual,
                       m.content AS other_content, m.category AS other_category,
                       'in' AS direction
                FROM memory_relations mr JOIN memories m ON mr.source_id = m.id
@@ -994,11 +1040,11 @@ def find_similar_memories(
 ) -> list[dict[str, Any]]:
     """Find memories similar to a given one using FTS5 BM25.
 
-    If auto_link=True, creates INFERRED 'semantically_similar_to' edges
-    for good matches (BM25 score < -1.5).
-    Returns list of similar memories with scores.
+    If auto_link=True, creates INFERRED 'semantically_similar_to' edges only for very
+    strong matches (BM25 score < _AUTOLINK_THRESHOLD, default -2.5). Auto-links are
+    marked is_manual=False and are prunable by daily_maintenance.
+    Returns list of similar memories with scores; each entry includes 'auto_linked' bool.
     """
-    # Get the source memory content
     source = conn.execute(
         "SELECT content FROM memories WHERE id = ? AND workspace_id = ?",
         (memory_id, workspace_id),
@@ -1007,8 +1053,6 @@ def find_similar_memories(
         return []
 
     import re as _re_local
-    # Build FTS query: strip non-alphanumeric chars to avoid FTS5 syntax errors
-    # (e.g. "full-text" would be parsed as subtraction in FTS5)
     raw = source["content"][:80].split()
     words = [_re_local.sub(r"[^a-zA-Z0-9]", "", w) for w in raw]
     words = [w for w in words if len(w) > 3][:8]
@@ -1036,13 +1080,17 @@ def find_similar_memories(
     for row in rows:
         r = dict(row)
         r["similarity_score"] = round(abs(r["score"]), 3)
-        results.append(r)
-        if auto_link and r["score"] < -1.5:
-            link_memories(
+        linked = False
+        if auto_link and r["score"] < _AUTOLINK_THRESHOLD:
+            rel_id = link_memories(
                 conn, memory_id, row["id"], "semantically_similar_to",
                 workspace_id, "inferred",
                 min(1.0, abs(r["score"]) / 10.0),
+                is_manual=False,
             )
+            linked = rel_id is not None
+        r["auto_linked"] = linked
+        results.append(r)
     return results
 
 

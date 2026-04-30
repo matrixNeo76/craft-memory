@@ -5,12 +5,16 @@ import pytest
 from constants import TEST_SESSION_ID, TEST_WORKSPACE_ID
 
 from craft_memory_mcp.db import (
+    _AUTOLINK_THRESHOLD,
+    _PRUNE_AGE_DAYS,
+    _PRUNE_WEIGHT_THRESHOLD,
     find_similar_memories,
     get_relations,
     get_relations_by_role,
     god_facts,
     link_memories,
     memory_diff,
+    prune_inferred_edges,
     register_session,
     remember,
     upsert_fact,
@@ -282,3 +286,90 @@ def test_get_relations_by_role_ordered_by_weight(registered_conn):
     rels = get_relations_by_role(registered_conn, a, TEST_WORKSPACE_ID, role="context")
     assert len(rels) == 2
     assert rels[0]["weight"] >= rels[1]["weight"]
+
+
+# ─── μ-hygiene: is_manual flag, pruning, threshold ───────────────────
+
+def test_link_memories_manual_flag_default(registered_conn):
+    """link_memories default is_manual=True — edge has is_manual=1."""
+    a = _mem(registered_conn, "Source node", "note")
+    b = _mem(registered_conn, "Target node", "note")
+    link_memories(registered_conn, a, b, "extends", TEST_WORKSPACE_ID)
+    rels = get_relations(registered_conn, a, TEST_WORKSPACE_ID, direction="out")
+    assert len(rels) == 1
+    assert rels[0]["is_manual"] == 1
+
+
+def test_link_memories_auto_flag(registered_conn):
+    """link_memories with is_manual=False sets is_manual=0."""
+    a = _mem(registered_conn, "Source node B", "note")
+    b = _mem(registered_conn, "Target node B", "note")
+    link_memories(registered_conn, a, b, "semantically_similar_to",
+                  TEST_WORKSPACE_ID, is_manual=False)
+    rels = get_relations(registered_conn, a, TEST_WORKSPACE_ID, direction="out")
+    assert len(rels) == 1
+    assert rels[0]["is_manual"] == 0
+
+
+def test_prune_inferred_edges_removes_weak_old_auto(registered_conn):
+    """prune_inferred_edges deletes is_manual=0 edges below weight threshold."""
+    a = _mem(registered_conn, "Prune source", "note")
+    b = _mem(registered_conn, "Prune target weak", "note")
+    c = _mem(registered_conn, "Keep target strong", "note")
+    # Weak auto-link (prunable)
+    link_memories(registered_conn, a, b, "semantically_similar_to",
+                  TEST_WORKSPACE_ID, confidence_score=0.2, weight=0.1, is_manual=False)
+    # Strong manual link (must NOT be pruned even if weight is low)
+    link_memories(registered_conn, a, c, "semantically_similar_to",
+                  TEST_WORKSPACE_ID, confidence_score=0.2, weight=0.1, is_manual=True)
+
+    # Force age to 0 days — with age_days=0 threshold applies to all
+    pruned = prune_inferred_edges(registered_conn, TEST_WORKSPACE_ID,
+                                   weight_threshold=0.5, age_days=0)
+    assert pruned == 1  # Only the auto-link is removed
+
+    rels = get_relations(registered_conn, a, TEST_WORKSPACE_ID, direction="out")
+    assert len(rels) == 1
+    assert rels[0]["is_manual"] == 1  # Manual edge survived
+
+
+def test_prune_inferred_edges_respects_age(registered_conn):
+    """prune_inferred_edges does not remove edges younger than age_days threshold."""
+    a = _mem(registered_conn, "Age test source", "note")
+    b = _mem(registered_conn, "Age test target", "note")
+    link_memories(registered_conn, a, b, "semantically_similar_to",
+                  TEST_WORKSPACE_ID, weight=0.1, is_manual=False)
+
+    # age_days=999 means nothing is old enough to prune
+    pruned = prune_inferred_edges(registered_conn, TEST_WORKSPACE_ID,
+                                   weight_threshold=0.5, age_days=999)
+    assert pruned == 0
+
+
+def test_prune_manual_edges_never_pruned(registered_conn):
+    """Manual edges (is_manual=1) are never pruned regardless of weight."""
+    a = _mem(registered_conn, "Manual never prune source", "note")
+    b = _mem(registered_conn, "Manual never prune target", "note")
+    link_memories(registered_conn, a, b, "contradicts",
+                  TEST_WORKSPACE_ID, weight=0.01, is_manual=True)
+
+    pruned = prune_inferred_edges(registered_conn, TEST_WORKSPACE_ID,
+                                   weight_threshold=1.0, age_days=0)
+    assert pruned == 0
+
+
+def test_autolink_threshold_is_negative(registered_conn):
+    """_AUTOLINK_THRESHOLD is negative (BM25 negative scores) and stricter than -1.5."""
+    assert _AUTOLINK_THRESHOLD < -1.5, "Default threshold must be stricter than original -1.5"
+
+
+def test_find_similar_auto_linked_field_present(registered_conn):
+    """find_similar_memories returns auto_linked field in each result."""
+    a = _mem(registered_conn, "Python asyncio event loop programming guide", "note")
+    _mem(registered_conn, "asyncio coroutines and tasks tutorial", "note")
+
+    results = find_similar_memories(registered_conn, a, TEST_WORKSPACE_ID,
+                                     top_n=5, auto_link=False)
+    for r in results:
+        assert "auto_linked" in r
+        assert r["auto_linked"] is False  # auto_link=False, nothing linked
