@@ -126,6 +126,12 @@ Everything else — graph relationships, maintenance, diagnostics — is availab
 | **Core memory promotion** | `promote_to_core` marks a memory `is_core=1` — immune to exponential decay; `find_consolidation_candidates` surfaces non-core memories ready for pruning |
 | **Hyperedge roles** | Graph edges carry semantic `role` (core/context/detail/temporal/causal) and `weight` (0–1); `get_relations_by_role` for selective graph traversal |
 | **Local-first** | All data stays on your machine, no cloud sync, zero external dependencies |
+| **Observability** | `memory_stats` (aggregate counts), `generate_handoff` (auto structured handoff), `save_decision_record` (decision log with rationale) |
+| **Temporal lifecycle** | Memories carry `lifecycle_status` (`active / superseded / invalidated / needs_review`); `valid_from / valid_to` fields; full supersession chain via `superseded_by` FK |
+| **Boundary detection** | `classify_event` classifies any content into `DISCARD / EPISODIC / FACT_CANDIDATE / OPEN_LOOP / PROCEDURE_CANDIDATE / CORE_CANDIDATE` before storage |
+| **Procedural memory** | `procedures` table with `UNIQUE(workspace_id, name)` upsert; FTS5 porter index; trigger context + markdown steps + confidence; `save_procedure`, `search_procedures`, `get_applicable_procedures` |
+| **Scope hierarchy** | `scope_hierarchy` table: `session < project < workspace < user < global`; `get_scope_ancestors()` traverses the chain for coarse-to-fine fallback |
+| **Coarse-to-fine retrieval** | 3-layer pattern: Layer 1 = `search_memory` (FTS5 snippets), Layer 2 = `get_recent_memory` + `get_relations` (context), Layer 3 = `get_memory_bundle` (full batch fetch by IDs) |
 
 ---
 
@@ -152,6 +158,24 @@ Everything else — graph relationships, maintenance, diagnostics — is availab
 | `find_similar(memory_id, top_n, auto_link)` | Find semantically similar memories via FTS5 BM25; optionally auto-links results as INFERRED edges |
 | `god_facts(top_n)` | Return the N most impactful facts with `god_score`, `mention_count`, `confidence_type` |
 | `memory_diff(since_epoch)` | Return changes since a Unix timestamp: new memories, updated facts, new/closed loops |
+| **— Sprint 1: Observability —** | |
+| `memory_stats()` | Aggregate counts: memories by category/scope, is_core, lifecycle_status, open loops, facts, procedures |
+| `generate_handoff(limit)` | Auto-generate a structured markdown handoff from recent memories, open loops, and facts |
+| `save_decision_record(title, decision, options, rationale, outcome)` | Store a decision log entry as a tagged memory with structured metadata |
+| **— Sprint 2: Temporal Lifecycle —** | |
+| `invalidate_memory(memory_id, reason)` | Mark a memory as `invalidated` with a reason |
+| `get_memory_history(memory_id)` | Return the full supersession chain for a memory (follows `superseded_by` links) |
+| `flag_for_review(memory_id, reason)` | Mark a memory as `needs_review` |
+| `list_needs_review(limit)` | List memories awaiting review |
+| `approve_memory(memory_id)` | Restore a `needs_review` memory to `active` status |
+| **— Sprint 3: Boundary Detection —** | |
+| `classify_event(content, importance, category)` | Classify content into a MemoryClass before deciding how to store it |
+| **— Sprint 4: Procedural Memory —** | |
+| `save_procedure(name, trigger_context, steps_md, confidence)` | Upsert a named procedure. Idempotent by name within workspace. |
+| `search_procedures(query, limit)` | FTS5 porter search over procedures (name + trigger + steps) |
+| `get_applicable_procedures(current_context, limit)` | Find the most relevant procedures for the current task |
+| **— Sprint 5: Scope Hierarchy + Retrieval —** | |
+| `get_memory_bundle(memory_ids)` | Batch-fetch N complete memories by ID list. Layer 3 of coarse-to-fine retrieval. |
 
 ---
 
@@ -236,15 +260,19 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 19 tools, health check
+│   │   ├── server.py        # FastMCP server, 33 tools, health check
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
 │   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
 │   │   │   ├── 002_global_dedup.sql
 │   │   │   ├── 003_tags.sql
-│   │   │   ├── 004_relations.sql  # knowledge graph: memory_relations + confidence_type
+│   │   │   ├── 004_relations.sql       # knowledge graph: memory_relations + confidence_type
 │   │   │   ├── 005_core_promotion.sql  # is_core flag + consolidated_from column
-│   │   │   └── 006_relation_roles.sql  # hyperedge role + weight on memory_relations
+│   │   │   ├── 006_relation_roles.sql  # hyperedge role + weight on memory_relations
+│   │   │   ├── 007_edge_manual_flag.sql
+│   │   │   ├── 008_fact_temporal.sql   # lifecycle status + temporal fields
+│   │   │   ├── 009_procedures.sql      # procedural memory + FTS5 index
+│   │   │   └── 010_scope_hierarchy.sql # scope hierarchy (session→global)
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -257,7 +285,7 @@ craft-memory/
 │   └── session-handoff/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
-├── tests/                   # pytest suite (58 tests: core + graph + EverOS patterns)
+├── tests/                   # pytest suite (127 tests: core, graph, observability, temporal, policy, procedures, scopes)
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```

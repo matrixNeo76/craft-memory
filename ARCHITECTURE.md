@@ -1,7 +1,7 @@
 # Craft Memory System — Complete Architectural Documentation
 
 > **Date**: 2026-04-30
-> **Version**: 4.0 (Phase 14 — 19 tools, EverOS patterns: RRF hybrid search, core memory promotion, hyperedge roles)
+> **Version**: 5.0 (Sprint 1–5 — 33 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy)
 > **Environment**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -149,29 +149,43 @@ _PRIVATE_PATTERNS = _re.compile(
 )
 ```
 
-**19 tools exposed**:
+**33 tools exposed** (19 baseline + 14 added in Sprints 1–5):
 
-| Tool | Purpose | R/W |
-|------|---------|-----|
-| `remember` | Save episodic memory (with privacy stripping and tags) | Write |
-| `update_memory` | Update content/category/importance of an existing memory | Write |
-| `search_memory` | RRF hybrid search: BM25 FTS5 + Jaccard word-overlap fused via `1/(k+rank)`; LIKE fallback; `use_rrf=True` param | Read |
-| `search_by_tag` | Filter memories by tag | Read |
-| `get_recent_memory` | Memories ranked by importance decay; supports token budget | Read |
-| `upsert_fact` | Save/update stable fact with confidence score and `confidence_type` | Write |
-| `list_open_loops` | List open loops ordered by priority | Read |
-| `add_open_loop` | Create new cross-session loop | Write |
-| `close_open_loop` | Close a loop with optional resolution | Write |
-| `update_open_loop` | Update fields on an existing loop (title, description, priority, status) with enum validation | Write |
-| `summarize_scope` | Full snapshot: memories (decay-ranked) + facts + loops | Read |
-| `save_summary` | Save structured handoff document (decisions, facts, next_steps) | Write |
-| `run_maintenance` | Cleanup old memories, trim summaries, dedup, VACUUM | Write |
-| `promote_to_core` | Set `is_core=1` on a memory — immune to exponential decay | Write |
-| `link_memories` | Create directed graph edge; `role` (core/context/detail/temporal/causal) and `weight` (0–1) params | Write |
-| `get_relations` | Return all neighbors (in/out/both) of a memory in the graph | Read |
-| `find_similar` | FTS5 BM25 similarity search; `auto_link=True` creates INFERRED edges | Read |
-| `god_facts` | Top N facts by impact: `confidence × type_bonus × (1 + mention_count × 0.2)` | Read |
-| `memory_diff` | Delta since epoch timestamp: new memories, updated facts, opened/closed loops | Read |
+| Tool | Purpose | R/W | Sprint |
+|------|---------|-----|--------|
+| `remember` | Save episodic memory (with privacy stripping and tags) | Write | baseline |
+| `update_memory` | Update content/category/importance of an existing memory | Write | baseline |
+| `search_memory` | RRF hybrid search: BM25 FTS5 + Jaccard word-overlap; LIKE fallback; lifecycle filter | Read | baseline |
+| `search_by_tag` | Filter memories by tag | Read | baseline |
+| `get_recent_memory` | Memories ranked by importance decay; supports token budget; lifecycle filter | Read | baseline |
+| `upsert_fact` | Save/update stable fact with confidence score and `confidence_type` | Write | baseline |
+| `list_open_loops` | List open loops ordered by priority | Read | baseline |
+| `add_open_loop` | Create new cross-session loop | Write | baseline |
+| `close_open_loop` | Close a loop with optional resolution | Write | baseline |
+| `update_open_loop` | Update fields on an existing loop with enum validation | Write | baseline |
+| `summarize_scope` | Full snapshot: memories (decay-ranked) + facts + loops | Read | baseline |
+| `save_summary` | Save structured handoff document (decisions, facts, next_steps) | Write | baseline |
+| `run_maintenance` | Cleanup old memories, trim summaries, dedup, VACUUM | Write | baseline |
+| `promote_to_core` | Set `is_core=1` on a memory — immune to exponential decay | Write | baseline |
+| `link_memories` | Create directed graph edge; `role` and `weight` (0–1) params | Write | baseline |
+| `get_relations` | Return all neighbors (in/out/both) of a memory in the graph | Read | baseline |
+| `find_similar` | FTS5 BM25 similarity search; `auto_link=True` creates INFERRED edges | Read | baseline |
+| `god_facts` | Top N facts by impact: `confidence × type_bonus × (1 + mention_count × 0.2)` | Read | baseline |
+| `memory_diff` | Delta since epoch timestamp: new memories, updated facts, opened/closed loops | Read | baseline |
+| `memory_stats` | Aggregate stats: memory count by scope/category, is_core count, open loops, facts, procedures | Read | Sprint 1 |
+| `explain_retrieval` | Explain why a memory would be retrieved: score, decay, is_core, tags | Read | Sprint 1 |
+| `generate_handoff` | Auto-generate structured handoff from recent memories, open loops, and facts | Read | Sprint 1 |
+| `save_decision_record` | Save a tagged memory with decision metadata (options, rationale, outcome) | Write | Sprint 1 |
+| `invalidate_memory` | Set lifecycle_status to `invalidated` with a reason | Write | Sprint 2 |
+| `get_memory_history` | Return the supersession chain for a memory (follows `superseded_by` links) | Read | Sprint 2 |
+| `flag_for_review` | Set lifecycle_status to `needs_review` with a reason | Write | Sprint 2 |
+| `list_needs_review` | List memories in `needs_review` state, ordered by created_at | Read | Sprint 2 |
+| `approve_memory` | Restore a `needs_review` memory to `active` lifecycle status | Write | Sprint 2 |
+| `classify_event` | Classify content into MemoryClass (DISCARD/EPISODIC/FACT_CANDIDATE/OPEN_LOOP/PROCEDURE_CANDIDATE/CORE_CANDIDATE) | Read | Sprint 3 |
+| `save_procedure` | Upsert a named procedure with trigger context, steps (markdown), and confidence | Write | Sprint 4 |
+| `search_procedures` | FTS5 search over procedures (name + trigger + steps) | Read | Sprint 4 |
+| `get_applicable_procedures` | Find the most applicable procedures for the current task context | Read | Sprint 4 |
+| `get_memory_bundle` | Batch-fetch N complete memories by ID list (Layer 3 coarse-to-fine retrieval) | Read | Sprint 5 |
 
 ### 3.2 File: `src/db.py`
 
@@ -217,29 +231,66 @@ SQLite data layer. Main functions:
 - `summarize_scope(...)` → uses decay ranking for recent memories (aligned with `get_recent_memory`)
 
 **Maintenance**:
-- `daily_maintenance(...)` → `delete_old_memories` + `mark_stale_loops` + `trim_session_summaries` + `dedup_memories` + `VACUUM`
+- `daily_maintenance(...)` → `delete_old_memories` + `mark_stale_loops` + `trim_session_summaries` + `dedup_memories` + `VACUUM`; returns dict including `needs_review` count (Sprint 2)
 - `trim_session_summaries(conn, workspace_id, keep_last=20)`
+
+**Observability — Sprint 1**:
+- `get_memory_stats(conn, workspace_id)` → aggregate stats: memory count by category/scope, is_core, lifecycle_status, open loops, facts, procedures
+- `generate_handoff(conn, workspace_id, session_id, limit)` → builds structured handoff from recent memories + open loops + facts; output is a markdown document
+- `save_decision_record(conn, session_id, workspace_id, title, decision, ...)` → stores a tagged memory with category `decision` and structured metadata
+
+**Temporal Lifecycle — Sprint 2** (migration 008_fact_temporal):
+- Adds `valid_from`, `valid_to`, `superseded_by`, `lifecycle_status` columns to `memories`
+- `lifecycle_status` values: `active | superseded | invalidated | needs_review`
+- `invalidate_memory(conn, memory_id, workspace_id, reason)` → sets `lifecycle_status='invalidated'`
+- `get_memory_history(conn, memory_id, workspace_id)` → follows `superseded_by` FK chain; returns chronological list
+- `flag_for_review(conn, memory_id, workspace_id, reason)` → sets `lifecycle_status='needs_review'`
+- `list_needs_review(conn, workspace_id, limit)` → lists memories awaiting review
+- `approve_memory(conn, memory_id, workspace_id)` → resets `lifecycle_status='active'`
+- `search_memory` and `get_recent_memory` extended: `include_inactive=False`, `lifecycle_filter` param
+
+**Boundary Detection — Sprint 3**:
+- `MemoryClass(str, Enum)` → `DISCARD | EPISODIC | FACT_CANDIDATE | OPEN_LOOP | PROCEDURE_CANDIDATE | CORE_CANDIDATE`
+- `classify_memory_event(content, context_signals, conn, workspace_id) → tuple[MemoryClass, str]` → heuristic classifier; returns class + reasoning string
+
+**Procedural Memory — Sprint 4** (migration 009_procedures):
+- `save_procedure(conn, workspace_id, name, trigger_context, steps_md, ...)` → UPSERT with `UNIQUE(workspace_id, name)`; syncs `procedures_fts` standalone FTS5 index (delete + re-insert)
+- `search_procedures(conn, query, workspace_id, limit)` → porter FTS5 search over name + trigger_context + steps_md
+- `get_applicable_procedures(conn, context, workspace_id, limit)` → active procedures ordered by confidence desc
+- `list_procedures(conn, workspace_id, status, limit)` → list by status
+
+**Scope Hierarchy — Sprint 5** (migration 010_scope_hierarchy):
+- `get_scope_ancestors(conn, scope) → list[str]` → reads `scope_hierarchy` table; returns scope + all ancestors from specific to broad; graceful fallback to hardcoded order if table missing
+- `get_memory_bundle(conn, memory_ids, workspace_id) → list[dict]` → batch-fetch by ID list with workspace isolation; missing IDs silently skipped; returns full row dicts
 
 ### 3.3 File: `src/schema.sql` + `src/migrations/`
 
 Base schema (v1) + versioned migrations:
 
-| Table | Purpose |
-|-------|---------|
-| `sessions` | Session tracking (craft_session_id, model, status) |
-| `memories` | Episodic memories with category, importance, scope, tags, dedup hash |
-| `memories_fts` | FTS5 index with porter stemmer + unicode61; category/scope UNINDEXED |
-| `facts` | Stable knowledge (UNIQUE key+workspace+scope) with confidence score |
-| `open_loops` | Incomplete tasks with priority and status |
-| `session_summaries` | Structured handoff documents between sessions |
-| `schema_version` | Version tracker for migration runner |
+| Table | Purpose | Added |
+|-------|---------|-------|
+| `sessions` | Session tracking (craft_session_id, model, status) | v1 |
+| `memories` | Episodic memories with category, importance, scope, tags, dedup hash, lifecycle_status | v1 + Sprint 2 |
+| `memories_fts` | FTS5 index with porter stemmer + unicode61; category/scope UNINDEXED | v1 |
+| `facts` | Stable knowledge (UNIQUE key+workspace+scope) with confidence score | v1 |
+| `open_loops` | Incomplete tasks with priority and status | v1 |
+| `session_summaries` | Structured handoff documents between sessions | v1 |
+| `memory_relations` | Directed knowledge graph edges (relation, role, weight, confidence) | migration 004 |
+| `schema_version` | Version tracker for migration runner | v1 |
+| `procedures` | Named reusable workflows with trigger context and markdown steps | migration 009 (Sprint 4) |
+| `procedures_fts` | Standalone FTS5 index for procedures (porter tokenizer) | migration 009 (Sprint 4) |
+| `scope_hierarchy` | Scope inheritance chain (session→project→workspace→user→global) | migration 010 (Sprint 5) |
 
 **Applied migrations**:
 - `002_global_dedup.sql`: changes UNIQUE from `(session_id, content_hash)` to `(workspace_id, content_hash)`; recreates FTS5 with category/scope UNINDEXED
 - `003_tags.sql`: adds `tags TEXT` column to `memories` + index
 - `004_relations.sql`: adds `confidence_type TEXT DEFAULT 'extracted' CHECK(...)` to `facts`; creates `memory_relations` table with 5 indexes; FK CASCADE on `memories(id)`
-- `005_core_promotion.sql`: adds `is_core INTEGER DEFAULT 0 CHECK(is_core IN (0, 1))` and `consolidated_from TEXT` to `memories`; creates partial index `WHERE is_core = 1`
-- `006_relation_roles.sql`: adds `role TEXT DEFAULT 'context' CHECK(role IN ('core','context','detail','temporal','causal'))` and `weight REAL DEFAULT 1.0 CHECK(weight BETWEEN 0 AND 1)` to `memory_relations`; creates index on `(workspace_id, role)`
+- `005_core_promotion.sql`: adds `is_core INTEGER DEFAULT 0` and `consolidated_from TEXT` to `memories`; creates partial index `WHERE is_core = 1`
+- `006_relation_roles.sql`: adds `role TEXT DEFAULT 'context'` and `weight REAL DEFAULT 1.0` to `memory_relations`; creates index on `(workspace_id, role)`
+- `007_edge_manual_flag.sql`: adds `is_manual INTEGER DEFAULT 0` to `memory_relations` to distinguish human-created edges from auto-linked ones
+- `008_fact_temporal.sql` (Sprint 2): adds `valid_from`, `valid_to`, `superseded_by`, `lifecycle_status` to `memories`; `lifecycle_status CHECK IN ('active','superseded','invalidated','needs_review')`; partial index on `(workspace_id, lifecycle_status)`
+- `009_procedures.sql` (Sprint 4): creates `procedures` table with `UNIQUE(workspace_id, name)`; status `CHECK IN ('active','draft','deprecated')`; confidence `BETWEEN 0 AND 1`; standalone `procedures_fts USING fts5(name, trigger_context, steps_md, tokenize='porter ascii')`
+- `010_scope_hierarchy.sql` (Sprint 5): creates `scope_hierarchy` table with `scope` PK, `parent_scope` FK (self-referential), `level INTEGER`; seeds 5 canonical scopes: `session(0) → project(1) → workspace(2) → user(3) → global(4)`
 
 **`memory_relations` table** (introduced in v3.0, extended in v4.0):
 
@@ -714,8 +765,13 @@ Tools are organized into three groups to reduce cognitive load. The **core group
 | Group | Tools | When to use |
 |-------|-------|-------------|
 | **core** | `remember`, `search_memory`, `get_recent_memory`, `upsert_fact`, `list_open_loops` | Every session — the default session flow |
-| **graph** | `link_memories`, `get_relations`, `find_similar`, `god_facts`, `memory_diff`, `search_by_tag` | When building or exploring relationships between memories |
+| **graph** | `link_memories`, `get_relations`, `find_similar`, `god_facts`, `memory_diff`, `search_by_tag` | Building or exploring relationships between memories |
 | **admin** | `run_maintenance`, `promote_to_core`, `summarize_scope`, `save_summary`, `update_memory`, `add_open_loop`, `close_open_loop`, `update_open_loop` | Lifecycle management and housekeeping |
+| **observability** | `memory_stats`, `generate_handoff`, `save_decision_record` | Diagnostics and session handoff (Sprint 1) |
+| **lifecycle** | `invalidate_memory`, `get_memory_history`, `flag_for_review`, `list_needs_review`, `approve_memory` | Memory lifecycle management — review, invalidation, supersession (Sprint 2) |
+| **policy** | `classify_event` | Boundary detection before storing a memory event (Sprint 3) |
+| **procedures** | `save_procedure`, `search_procedures`, `get_applicable_procedures` | Capturing and retrieving reusable workflows (Sprint 4) |
+| **retrieval** | `get_memory_bundle` | Layer 3 coarse-to-fine: batch-fetch full memory detail after search (Sprint 5) |
 
 Tool docstrings in `server.py` are prefixed with `[graph]` or `[admin]` for non-core tools. Core tools have no prefix — they are the default path.
 
