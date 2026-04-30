@@ -1,7 +1,7 @@
 # Craft Memory System — Documentazione Architetturale Completa
 
 > **Data**: 2026-04-30  
-> **Versione**: 3.0 (Phase 10 — 17 tools, knowledge graph layer, confidence labels, god_facts, memory_diff)  
+> **Versione**: 4.0 (Phase 14 — 19 tools, EverOS patterns: RRF hybrid search, core memory promotion, hyperedge roles)  
 > **Ambiente**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -148,23 +148,25 @@ _PRIVATE_PATTERNS = _re.compile(
 )
 ```
 
-**17 tool esposti**:
+**19 tool esposti**:
 
 | Tool | Scopo | Lettura/Scrittura |
 |------|-------|-------------------|
 | `remember` | Salva memoria episodica (con privacy stripping e tags) | Scrittura |
 | `update_memory` | Aggiorna content/category/importance di una memoria esistente | Scrittura |
-| `search_memory` | Ricerca FTS5 + BM25 hybrid ranking; LIKE fallback sicuro | Lettura |
+| `search_memory` | RRF hybrid search: BM25 FTS5 + Jaccard word-overlap fusi via `1/(k+rank)`; LIKE fallback; param `use_rrf=True` | Lettura |
 | `search_by_tag` | Filtra memorie per tag | Lettura |
 | `get_recent_memory` | Memorie ranked per importance decay; supporta token budget | Lettura |
 | `upsert_fact` | Salva/aggiorna fact stabile con confidence score e `confidence_type` | Scrittura |
 | `list_open_loops` | Lista loop aperti per priorità | Lettura |
 | `add_open_loop` | Crea nuovo loop cross-session | Scrittura |
 | `close_open_loop` | Chiude un loop con risoluzione opzionale | Scrittura |
+| `update_open_loop` | Aggiorna campi di un loop esistente (title, description, priority, status) con validazione enum | Scrittura |
 | `summarize_scope` | Snapshot completo: memorie (decay-ranked) + facts + loops | Lettura |
 | `save_summary` | Salva documento di handoff strutturato (decisions, facts, next_steps) | Scrittura |
 | `run_maintenance` | Cleanup old memories, trim summaries, dedup, VACUUM | Scrittura |
-| `link_memories` | Crea arco diretto nel knowledge graph tra due memorie | Scrittura |
+| `promote_to_core` | Imposta `is_core=1` su una memoria — immune al decay esponenziale | Scrittura |
+| `link_memories` | Crea arco diretto nel knowledge graph; parametri `role` (core/context/detail/temporal/causal) e `weight` (0–1) | Scrittura |
 | `get_relations` | Restituisce tutti i vicini (in/out/both) di una memoria nel grafo | Lettura |
 | `find_similar` | FTS5 BM25 similarity search; opzione `auto_link` per creare archi INFERRED | Lettura |
 | `god_facts` | Top N fact per impatto: `confidence × type_bonus × (1 + mention_count × 0.2)` | Lettura |
@@ -177,7 +179,7 @@ Layer dati SQLite. Funzioni principali:
 **Infrastruttura**:
 - `run_migrations(conn)` → applica `schema.sql` come v1 poi `migrations/NNN_*.sql` in ordine; usa tabella `schema_version` come tracker
 - `init_db(db_path)` → connessione WAL + esegue migrazioni; FK off durante migrazioni, on dopo
-- `_effective_importance(importance, created_at_epoch)` → `importance × e^(-λ × age_days)` con λ da `CRAFT_MEMORY_DECAY_LAMBDA` (default 0.005)
+- `_effective_importance(importance, created_at_epoch, is_core=False)` → se `is_core=True` ritorna `float(importance)` senza decay; altrimenti `importance × e^(-λ × age_days)` con λ da `CRAFT_MEMORY_DECAY_LAMBDA` (default 0.005)
 
 **Memories**:
 - `remember(...)` → INSERT con dedup globale `UNIQUE(workspace_id, content_hash)` — un contenuto per workspace, indipendente dalla sessione; supporta `tags` (JSON array)
@@ -189,11 +191,22 @@ Layer dati SQLite. Funzioni principali:
 **Facts / Open Loops**:
 - `upsert_fact(...)` → `ON CONFLICT DO UPDATE` su `UNIQUE(key, workspace_id, scope)`; accetta `confidence_type: str = "extracted"` (`extracted | inferred | ambiguous`)
 - `create_open_loop(...)` / `list_open_loops(...)` / `close_open_loop(...)`
+- `update_open_loop(conn, loop_id, workspace_id, title, description, priority, status)` → aggiorna campi opzionali; valida `priority` ∈ `{low, medium, high, critical}` e `status` ∈ `{open, in_progress, closed, stale}`; costruisce SET clause dinamicamente; ritorna `bool`
+
+**RRF Hybrid Search** (Phase 11 — μ1):
+- `_rrf_score(bm25_ranks, overlap_ranks, k=60) → dict[int, float]` → Reciprocal Rank Fusion: `score = Σ 1/(k+rank)` su due ranking ordinali; nessun embedding richiesto
+- `hybrid_search(conn, query, workspace_id, scope, limit, k=60)` → pool FTS5 BM25 (×2 limit) + Jaccard word-overlap ranking parallelo; fonde i due con RRF; fallback LIKE se FTS5 fallisce; parole sanificate via `re.sub(r"[^a-zA-Z0-9]", "", w)` per evitare errori FTS5 da trattini/punteggiatura
+
+**Core Memory Promotion** (Phase 12 — μ2):
+- `promote_memory_to_core(conn, memory_id, workspace_id) → bool` → imposta `is_core=1`; memorie core non decadono (`_effective_importance` ritorna importance diretta)
+- `demote_memory_from_core(conn, memory_id, workspace_id) → bool` → imposta `is_core=0`; ripristina decay normale
+- `find_consolidation_candidates(conn, workspace_id, importance_threshold=2.0, age_days=30)` → query con subquery wrapper per calcolare `effective_importance` inline (evita `HAVING` senza `GROUP BY`, bug SQLite); ritorna memorie non-core con effective_importance < soglia, vecchie ≥30gg, ordinate ASC, limite 50
 
 **Knowledge Graph Layer** (Phase 10):
 - `_content_hash(content, kind)` → SHA256 full (non troncato) + kind namespace (`"\x00{kind}"`) per evitare collisioni cross-entità
-- `link_memories(conn, source_id, target_id, relation, workspace_id, confidence_type, confidence_score)` → inserisce arco diretto in `memory_relations`; `UNIQUE(source_id, target_id, relation)` per idempotenza; ritorna row id o None se duplicato/relazione invalida. Relazioni ammesse: `caused_by | contradicts | extends | implements | supersedes | semantically_similar_to`
+- `link_memories(conn, source_id, target_id, relation, workspace_id, confidence_type, confidence_score, role="context", weight=1.0)` → inserisce arco diretto in `memory_relations`; `UNIQUE(source_id, target_id, relation)` per idempotenza; valida `role` ∈ `{core, context, detail, temporal, causal}` e `relation`; ritorna row id o None. Relazioni ammesse: `caused_by | contradicts | extends | implements | supersedes | semantically_similar_to`
 - `get_relations(conn, memory_id, workspace_id, direction="both")` → restituisce vicini con label direzione (`"in"` / `"out"`); JOIN con `memories` per content preview
+- `get_relations_by_role(conn, memory_id, workspace_id, role, direction="both")` → filtra archi per semantic role; ordinati per `weight DESC`; usabile per traversal selettivo (es. solo relazioni `causal` o `core`)
 - `find_similar_memories(conn, memory_id, workspace_id, top_n=5, auto_link=False)` → estrae content della memoria, sanifica le parole (`re.sub(r"[^a-zA-Z0-9]", "", w)` per evitare errori FTS5 da trattini/punteggiatura), costruisce `"word1 OR word2 OR ..."`, esegue FTS5 BM25 search escludendo la memoria sorgente; se `auto_link=True` e BM25 score < -1.5, crea arco `semantically_similar_to` con `confidence_type="inferred"`
 - `god_facts(conn, workspace_id, top_n=10)` → score = `confidence × type_bonus × (1 + mention_count × 0.2)`; `type_bonus`: extracted=1.0, inferred=0.8, ambiguous=0.5; ordina DESC, ritorna con campo `god_score`
 - `memory_diff(conn, workspace_id, since_epoch)` → ritorna `{new_memories: [...], updated_facts: [...], opened_loops: [...], closed_loops: [...]}` comparando `created_at_epoch` / `updated_at` (come ISO string) rispetto all'epoch fornito
@@ -221,10 +234,11 @@ Schema base (v1) + migrazioni versionate:
 | `schema_version` | Tracker versioni per migration runner |
 
 **Migrazioni applicate**:
-- `001_global_dedup.sql`: cambia UNIQUE da `(session_id, content_hash)` a `(workspace_id, content_hash)`; ricrea FTS5 con category/scope UNINDEXED
-- `002_global_dedup.sql`: stessa logica (numerazione dipende da ordine applicazione)
+- `002_global_dedup.sql`: cambia UNIQUE da `(session_id, content_hash)` a `(workspace_id, content_hash)`; ricrea FTS5 con category/scope UNINDEXED
 - `003_tags.sql`: aggiunge colonna `tags TEXT` a `memories` + index
-- `004_relations.sql`: aggiunge `confidence_type TEXT DEFAULT 'extracted' CHECK(...)` a `facts`; crea tabella `memory_relations` con 5 indici (source_id, target_id, workspace_id, confidence_type, relation); FK CASCADE su `memories(id)`
+- `004_relations.sql`: aggiunge `confidence_type TEXT DEFAULT 'extracted' CHECK(...)` a `facts`; crea tabella `memory_relations` con 5 indici; FK CASCADE su `memories(id)`
+- `005_core_promotion.sql`: aggiunge `is_core INTEGER DEFAULT 0 CHECK(is_core IN (0, 1))` e `consolidated_from TEXT` a `memories`; crea indice parziale `WHERE is_core = 1`
+- `006_relation_roles.sql`: aggiunge `role TEXT DEFAULT 'context' CHECK(role IN ('core','context','detail','temporal','causal'))` e `weight REAL DEFAULT 1.0 CHECK(weight BETWEEN 0 AND 1)` a `memory_relations`; crea indice su `(workspace_id, role)`
 
 **Tabella `memory_relations`** (introdotta in v3.0):
 
@@ -238,6 +252,8 @@ Schema base (v1) + migrazioni versionate:
 | `confidence_score` | REAL | 0.0–1.0 |
 | `workspace_id` | TEXT | Isolamento per workspace |
 | `created_at_epoch` | INTEGER | Unix timestamp creazione |
+| `role` | TEXT | Semantic role dell'arco: `core | context | detail | temporal | causal` (default: `context`) |
+| `weight` | REAL | Peso dell'arco 0.0–1.0 (default: 1.0); usato per graph traversal ordinato |
 
 Il migration runner in `db.py:run_migrations()` controlla `MAX(version)` dalla tabella `schema_version` e applica solo le migrazioni pending.
 
@@ -304,12 +320,14 @@ python ensure-running.py --stop   # Stop processo sulla porta
     { "pattern": "get_relations", "comment": "Get graph neighbors of a memory" },
     { "pattern": "find_similar", "comment": "FTS5 BM25 similarity search" },
     { "pattern": "god_facts", "comment": "Top facts by impact score" },
-    { "pattern": "memory_diff", "comment": "Delta since epoch timestamp" }
+    { "pattern": "memory_diff", "comment": "Delta since epoch timestamp" },
+    { "pattern": "update_open_loop", "comment": "Update open loop fields" },
+    { "pattern": "promote_to_core", "comment": "Promote memory to core (no decay)" }
   ]
 }
 ```
 
-Questi pattern permettono a tutti i 17 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
+Questi pattern permettono a tutti i 19 tool di funzionare anche in modalità Explore (safe). I pattern sono scope-ati automaticamente al source slug `memory`.
 
 ### 4.3 Workspace: `config.json`
 

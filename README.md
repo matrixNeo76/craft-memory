@@ -108,6 +108,9 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 | **god_facts** | Top N most impactful facts ranked by `confidence × type_bonus × (1 + mention_count × 0.2)` — the most load-bearing knowledge at a glance |
 | **memory_diff** | Delta since a Unix timestamp: new memories, updated facts, opened/closed loops — ideal for session catch-up |
 | **Semantic similarity** | `find_similar` uses FTS5 BM25 to find related memories; `auto_link=True` auto-creates INFERRED graph edges |
+| **RRF hybrid search** | `search_memory` fuses FTS5 BM25 + Jaccard word-overlap via Reciprocal Rank Fusion `1/(k+rank)` — no embeddings needed; +6-8% accuracy over linear weighting |
+| **Core memory promotion** | `promote_to_core` marks a memory `is_core=1` — immune to exponential decay; `find_consolidation_candidates` surfaces non-core memories ready for pruning |
+| **Hyperedge roles** | Graph edges carry semantic `role` (core/context/detail/temporal/causal) and `weight` (0–1); `get_relations_by_role` for selective graph traversal |
 | **Local-first** | All data stays on your machine, no cloud sync, zero external dependencies |
 
 ---
@@ -118,17 +121,19 @@ The SessionStart automation will run `craft-memory ensure` automatically at the 
 |------|---------|
 | `remember(content, category, scope, importance, tags)` | Save an episodic memory. Categories: `decision`, `discovery`, `bugfix`, `feature`, `refactor`, `change`, `note` |
 | `update_memory(id, content, category, importance)` | Update an existing memory's content, category, or importance |
-| `search_memory(query, scope, limit)` | Full-text search over all memories (FTS5 + BM25 hybrid ranking) |
+| `search_memory(query, scope, limit, use_rrf)` | RRF hybrid search: FTS5 BM25 + Jaccard word-overlap fused via Reciprocal Rank Fusion; `use_rrf=False` falls back to linear BM25 |
 | `search_by_tag(tag, scope, limit)` | Find memories by tag |
 | `get_recent_memory(scope, limit, max_tokens)` | Get memories ranked by importance decay; `max_tokens` caps the context budget |
 | `upsert_fact(key, value, scope, confidence)` | Save or update a stable fact. Idempotent. |
 | `list_open_loops(scope)` | List open tasks ordered by priority (critical → high → medium → low) |
 | `add_open_loop(title, description, priority, scope)` | Create a new open loop to track across sessions |
 | `close_open_loop(id, resolution)` | Close a loop with an optional resolution note |
+| `update_open_loop(id, title, description, priority, status)` | Update fields on an existing open loop; validates priority/status enums |
 | `summarize_scope(scope)` | Generate a full snapshot: memories + facts + loops + latest summary |
 | `save_summary(summary, decisions, facts_learned, open_loops, refs, next_steps)` | Save a structured session handoff document |
 | `run_maintenance()` | Cleanup old memories, trim summaries, dedup, VACUUM |
-| `link_memories(source_id, target_id, relation, confidence_type, confidence_score)` | Create a directed edge between two memories in the knowledge graph |
+| `promote_to_core(id)` | Mark a memory as core (`is_core=1`) — immune to importance decay |
+| `link_memories(source_id, target_id, relation, confidence_type, confidence_score, role, weight)` | Create a directed edge; `role` classifies semantic type (core/context/detail/temporal/causal), `weight` sets traversal priority |
 | `get_relations(memory_id, direction)` | Get graph neighbors of a memory (`in`, `out`, or `both`) |
 | `find_similar(memory_id, top_n, auto_link)` | Find semantically similar memories via FTS5 BM25; optionally auto-links results as INFERRED edges |
 | `god_facts(top_n)` | Return the N most impactful facts with `god_score`, `mention_count`, `confidence_type` |
@@ -217,14 +222,15 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 12 tools, health check
+│   │   ├── server.py        # FastMCP server, 19 tools, health check
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
 │   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
-│   │   │   ├── 001_global_dedup.sql
 │   │   │   ├── 002_global_dedup.sql
 │   │   │   ├── 003_tags.sql
-│   │   │   └── 004_relations.sql  # knowledge graph: memory_relations + confidence_type
+│   │   │   ├── 004_relations.sql  # knowledge graph: memory_relations + confidence_type
+│   │   │   ├── 005_core_promotion.sql  # is_core flag + consolidated_from column
+│   │   │   └── 006_relation_roles.sql  # hyperedge role + weight on memory_relations
 │   │   └── cli.py           # craft-memory CLI
 │   ├── server.py            # Shim → craft_memory_mcp.server
 │   └── db.py                # Shim → craft_memory_mcp.db
@@ -237,7 +243,7 @@ craft-memory/
 │   └── session-handoff/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records (ADR-001 → ADR-008)
-├── tests/                   # pytest suite (42 tests: core + graph layer)
+├── tests/                   # pytest suite (58 tests: core + graph + EverOS patterns)
 ├── pyproject.toml
 └── ARCHITECTURE.md
 ```
