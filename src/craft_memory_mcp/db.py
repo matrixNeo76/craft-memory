@@ -1216,3 +1216,162 @@ def update_memory(
     )
     conn.commit()
     return cursor.rowcount > 0
+
+
+# --- Sprint 1: Observability ---
+
+
+def get_memory_stats(
+    conn,
+    workspace_id: str,
+    scope=None,
+):
+    """Aggregate stats for a workspace: counts, averages, edge breakdown."""
+    scope_filter = "AND scope = ?" if scope else ""
+    base_params = [workspace_id]
+    if scope:
+        base_params.append(scope)
+
+    rows = conn.execute(
+        "SELECT category, COUNT(*) AS cnt FROM memories"
+        " WHERE workspace_id = ? " + scope_filter +
+        " GROUP BY category",
+        base_params,
+    ).fetchall()
+    by_category = {r["category"]: r["cnt"] for r in rows}
+    total_memories = sum(by_category.values())
+
+    core_row = conn.execute(
+        "SELECT COUNT(*) FROM memories"
+        " WHERE workspace_id = ? AND is_core = 1 " + scope_filter,
+        base_params,
+    ).fetchone()
+    core_memories = core_row[0] if core_row else 0
+
+    avg_row = conn.execute(
+        "SELECT AVG(importance) FROM memories WHERE workspace_id = ? " + scope_filter,
+        base_params,
+    ).fetchone()
+    avg_importance = round(avg_row[0] or 0.0, 2)
+
+    loop_scope = "AND scope = ?" if scope else ""
+    loop_params = [workspace_id, "open"]
+    if scope:
+        loop_params.append(scope)
+    loop_row = conn.execute(
+        "SELECT COUNT(*) FROM open_loops WHERE workspace_id = ? AND status = ? " + loop_scope,
+        loop_params,
+    ).fetchone()
+    open_loops = loop_row[0] if loop_row else 0
+
+    total_edges = conn.execute(
+        "SELECT COUNT(*) FROM memory_relations WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()[0]
+
+    manual_edges = conn.execute(
+        "SELECT COUNT(*) FROM memory_relations WHERE workspace_id = ? AND is_manual = 1",
+        (workspace_id,),
+    ).fetchone()[0]
+
+    return {
+        "total_memories": total_memories,
+        "by_category": by_category,
+        "core_memories": core_memories,
+        "open_loops": open_loops,
+        "total_edges": total_edges,
+        "manual_edges": manual_edges,
+        "inferred_edges": total_edges - manual_edges,
+        "avg_importance": avg_importance,
+    }
+
+
+def explain_retrieval(
+    conn,
+    memory_id: int,
+    workspace_id: str,
+):
+    """Return diagnostic info for a memory: full row + edge graph.
+
+    Returns None if memory not found.
+    """
+    row = conn.execute(
+        "SELECT * FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        return None
+
+    mem = dict(row)
+    relations = get_relations(conn, memory_id, workspace_id, direction="both")
+
+    return {
+        "id": mem["id"],
+        "content": mem["content"],
+        "category": mem["category"],
+        "importance": mem["importance"],
+        "is_core": bool(mem.get("is_core", 0)),
+        "scope": mem["scope"],
+        "created_at": mem.get("created_at"),
+        "tags": mem.get("tags"),
+        "relations": relations,
+        "relation_count": len(relations),
+    }
+
+
+def generate_handoff(
+    conn,
+    workspace_id: str,
+    scope=None,
+    decisions_limit: int = 10,
+    facts_limit: int = 15,
+    loops_limit: int = 20,
+):
+    """Generate a structured session-handoff pack.
+
+    Returns recent_decisions, active_open_loops, recent_facts,
+    and memory_stats_snapshot.
+    """
+    scope_filter = "AND scope = ?" if scope else ""
+    base_params = [workspace_id]
+    if scope:
+        base_params.append(scope)
+
+    decision_rows = conn.execute(
+        "SELECT id, content, category, importance, created_at, tags FROM memories"
+        " WHERE workspace_id = ? AND category = 'decision' " + scope_filter +
+        " ORDER BY importance DESC, created_at_epoch DESC LIMIT ?",
+        base_params + [decisions_limit],
+    ).fetchall()
+
+    loop_scope = "AND scope = ?" if scope else ""
+    loop_params = [workspace_id, "open"]
+    if scope:
+        loop_params.append(scope)
+    loop_rows = conn.execute(
+        "SELECT id, title, description, priority, created_at FROM open_loops"
+        " WHERE workspace_id = ? AND status = ? " + loop_scope +
+        " ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
+        " WHEN 'medium' THEN 2 ELSE 3 END, created_at_epoch DESC LIMIT ?",
+        loop_params + [loops_limit],
+    ).fetchall()
+
+    fact_scope = "AND scope = ?" if scope else ""
+    fact_params = [workspace_id]
+    if scope:
+        fact_params.append(scope)
+    fact_rows = conn.execute(
+        "SELECT key, value, scope, confidence, confidence_type, updated_at FROM facts"
+        " WHERE workspace_id = ? " + fact_scope +
+        " ORDER BY confidence DESC, key LIMIT ?",
+        fact_params + [facts_limit],
+    ).fetchall()
+
+    return {
+        "generated_at": _now_iso(),
+        "scope": scope or "workspace",
+        "recent_decisions": [dict(r) for r in decision_rows],
+        "active_open_loops": [dict(r) for r in loop_rows],
+        "recent_facts": [dict(r) for r in fact_rows],
+        "memory_stats_snapshot": get_memory_stats(conn, workspace_id, scope=scope),
+    }

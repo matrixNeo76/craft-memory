@@ -87,6 +87,9 @@ from craft_memory_mcp.db import (
     update_memory as _db_update_memory,
     update_open_loop as _db_update_open_loop,
     upsert_fact as _db_upsert_fact,
+    explain_retrieval as _db_explain_retrieval,
+    generate_handoff as _db_generate_handoff,
+    get_memory_stats as _db_get_memory_stats,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -871,6 +874,148 @@ def memory_diff(
 
 
 # ─── Entry Point (called by CLI or directly) ─────────────────────────
+
+
+# --- Sprint 1: Observability & Handoff tools ---
+
+
+@mcp.tool()
+def memory_stats(
+    scope: str | None = None,
+) -> str:
+    """[admin] Aggregate stats for this workspace.
+
+    Args:
+        scope: Filter by scope (default: all scopes)
+
+    Returns:
+        Summary of workspace memory state
+    """
+    conn = _get_conn()
+    stats = _db_get_memory_stats(conn, WORKSPACE_ID, scope=scope)
+    lines = [
+        f"Workspace stats (scope={scope or 'all'}):",
+        f"  Memories: {stats['total_memories']} total ({stats['core_memories']} core, avg importance {stats['avg_importance']})",
+        f"  Categories: {stats['by_category']}",
+        f"  Open loops: {stats['open_loops']}",
+        f"  Edges: {stats['total_edges']} total ({stats['manual_edges']} manual, {stats['inferred_edges']} inferred)",
+    ]
+    return chr(10).join(lines)
+
+
+@mcp.tool()
+def explain_retrieval(
+    memory_id: int,
+) -> str:
+    """[admin] Diagnostic info for a specific memory: content, category, edge graph.
+
+    Args:
+        memory_id: ID of the memory to inspect
+
+    Returns:
+        Full memory details with relation graph
+    """
+    conn = _get_conn()
+    info = _db_explain_retrieval(conn, memory_id, WORKSPACE_ID)
+    if info is None:
+        return f"Memory #{memory_id} not found in this workspace."
+    out = [
+        f"Memory #{info['id']} [{info['category']}] importance={info['importance']} confidence={info['confidence_type']}",
+        f"  scope: {info['scope']}",
+        f"  created: {info.get('created_at', 'unknown')}",
+        f"  content: {info['content'][:300]}",
+    ]
+    if info['relations']:
+        out.append(f"  relations ({info['relation_count']}):")
+        for rel in info['relations'][:10]:
+            flag = ' [manual]' if rel.get('is_manual') else ' [inferred]'
+            other = rel['source_id'] if rel['direction'] == 'in' else rel['target_id']
+            out.append(f"    {rel['direction']} --{rel['relation']}--> #{other}{flag}")
+    else:
+        out.append('  relations: none')
+    return chr(10).join(out)
+
+
+@mcp.tool()
+def generate_handoff(
+    scope: str | None = None,
+) -> str:
+    """[core] Generate a structured session-handoff pack for context continuity.
+
+    Collects recent decisions, active open loops, recent facts and stats snapshot.
+
+    Args:
+        scope: Memory scope to filter (default: all)
+
+    Returns:
+        Formatted handoff document
+    """
+    conn = _get_conn()
+    pack = _db_generate_handoff(conn, WORKSPACE_ID, scope=scope)
+    out = [f"SESSION HANDOFF - {pack['generated_at']} (scope={pack['scope']})", '']
+
+    out.append(f"DECISIONS ({len(pack['recent_decisions'])}) :")
+    for d in pack['recent_decisions']:
+        out.append(f"  #{d['id']} importance={d['importance']}: {d['content'][:150]}")
+    if not pack['recent_decisions']:
+        out.append('  (none)')
+
+    out.append('')
+    out.append(f"OPEN LOOPS ({len(pack['active_open_loops'])}) :")
+    for lp in pack['active_open_loops']:
+        out.append(f"  [{lp['priority']}] {lp['title']}")
+    if not pack['active_open_loops']:
+        out.append('  (none)')
+
+    out.append('')
+    out.append(f"FACTS ({len(pack['recent_facts'])}) :")
+    for fc in pack['recent_facts']:
+        out.append(f"  {fc['key']}: {str(fc['value'])[:100]}")
+    if not pack['recent_facts']:
+        out.append('  (none)')
+
+    s = pack['memory_stats_snapshot']
+    out.append('')
+    out.append(f"STATS: {s['total_memories']} memories, {s['open_loops']} open loops, {s['total_edges']} edges")
+    return chr(10).join(out)
+
+
+@mcp.tool()
+def save_decision_record(
+    title: str,
+    context: str,
+    decision: str,
+    rationale: str,
+    scope: str = 'workspace',
+) -> str:
+    """[core] Save an architectural or product decision as a high-importance ADR memory.
+
+    Args:
+        title: Short title for the decision
+        context: Problem or situation that prompted this decision
+        decision: What was decided
+        rationale: Why this decision was made
+        scope: Memory scope (default: workspace)
+
+    Returns:
+        Confirmation with memory ID
+    """
+    conn = _get_conn()
+    nl = chr(10)
+    content = f"DECISION: {title}{nl}Context: {context}{nl}Decision: {decision}{nl}Rationale: {rationale}"
+    content = _strip_private(content)
+    mem_id = _db_remember(
+        conn, CRAFT_SESSION_ID, WORKSPACE_ID, content,
+        category='decision',
+        importance=9,
+        scope=scope,
+        source_session=CRAFT_SESSION_ID,
+        tags=['decision-record', 'architecture'],
+    )
+    _maybe_checkpoint(conn)
+    if mem_id is None:
+        return 'Duplicate decision record skipped.'
+    return f'Decision record #{mem_id} saved: {title}'
 
 def run_server():
     """Start the MCP server with the configured transport."""
