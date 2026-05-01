@@ -21,17 +21,7 @@
         "actions": [
           {
             "type": "prompt",
-            "prompt": "SESSION END PROTOCOL: Create a handoff document for the next session using the memory source.\n\nIf tool calls fail with connection errors, run: craft-memory ensure then retry.\n\n1. Call remember() for any key decisions made in this session (category='decision', importance=8)\n2. Call remember() for any important discoveries (category='discovery', importance=7)\n3. Call upsert_fact() for any confirmed, stable knowledge gained\n4. Call close_open_loop() for any loops that were resolved\n5. Call summarize_scope(scope='workspace') to generate a final snapshot\n\nPresent a compact handoff summary to the user showing: decisions, facts, open loops, next steps.\nThis ensures the next session (even with a different model/provider) can recover full context."
-          }
-        ]
-      },
-      {
-        "name": "Memory: Batch Save Discoveries (complement)",
-        "permissionMode": "allow-all",
-        "actions": [
-          {
-            "type": "prompt",
-            "prompt": "SESSION END — BATCH SAVE:\n\nDopo aver completato il protocollo standard di SessionEnd (che salva decisioni e fatti principali), esegui un batch_remember per salvare anche i fatti minori:\n\n1. Rivedi la conversazione della sessione\n2. Usa batch_remember (sul source memory) con entries per:\n   - Ogni piccola scoperta tecnica (categoria 'discovery', importance 5)\n   - Ogni change minore (categoria 'change', importance 4)\n   - Ogni nota utile (categoria 'note', importance 3)\n\nbatch_remember(entries_json='[{\"content\":\"...\",\"category\":\"discovery\",\"importance\":5,\"tags\":[\"...\"]}, ...]')\n\nNon duplicare ciò che è già stato salvato dal protocollo SessionEnd standard."
+            "prompt": "SESSION END PROTOCOL: Create a handoff document for the next session using the memory source.\n\nIf tool calls fail with connection errors, run: craft-memory ensure then retry.\n\n=== PHASE 1: KEY CONTENT ===\n1. Call remember() for any key decisions made in this session (category='decision', importance=8)\n2. Call remember() for any important discoveries (category='discovery', importance=7)\n3. Call upsert_fact() for any confirmed, stable knowledge gained\n4. Call close_open_loop() for any loops that were resolved\n\n=== PHASE 2: BATCH MINOR DISCOVERIES ===\nReview the conversation for minor items and save them in ONE round-trip:\nbatch_remember(entries_json='[{\"content\":\"...\",\"category\":\"discovery\",\"importance\":5}, {\"content\":\"...\",\"category\":\"change\",\"importance\":4}]')\n\n=== PHASE 3: SUMMARY ===\n5. Call summarize_scope(scope='workspace') to generate a final snapshot\n\nPresent a compact handoff summary to the user showing: decisions, facts, open loops, next steps.\nThis ensures the next session (even with a different model/provider) can recover full context."
           }
         ]
       }
@@ -58,7 +48,10 @@
         "cron": "0 18 * * 1-5",
         "timezone": "Europe/Rome",
         "permissionMode": "allow-all",
-        "labels": ["scheduled", "session-report"],
+        "labels": [
+          "scheduled",
+          "session-report"
+        ],
         "actions": [
           {
             "type": "prompt",
@@ -71,7 +64,10 @@
         "cron": "0 9 * * 1-5",
         "timezone": "Europe/Rome",
         "permissionMode": "allow-all",
-        "labels": ["scheduled", "session-reminder"],
+        "labels": [
+          "scheduled",
+          "session-reminder"
+        ],
         "actions": [
           {
             "type": "prompt",
@@ -100,7 +96,7 @@
         "actions": [
           {
             "type": "prompt",
-            "prompt": "CLASSIFICA INTENZIONE — primo messaggio della sessione:\n\nAnalizza il prompt utente e classifica lo scopo della sessione. Esegui SOLO sul primo UserPromptSubmit (se la classificazione esiste già, salta):\n\n- Se contiene 'refactor|migrate|upgrade|ristruttura' → remember(content='Sessione di refactoring: {riepilogo}', category='session', importance=6, tags=['session:classified','session:refactoring'])\n- Se contiene 'bug|fix|errore|non funziona' → remember(content='Sessione di bugfix: {riepilogo}', category='session', importance=6, tags=['session:classified','session:bugfix'])\n- Se contiene 'feature|implementa|crea|aggiungi|nuova' → remember(content='Sessione di sviluppo: {riepilogo}', category='session', importance=6, tags=['session:classified','session:feature'])\n- Se contiene 'deploy|release|pubblica' → remember(content='Sessione di deploy: {riepilogo}', category='session', importance=6, tags=['session:classified','session:deploy'])\n- default → remember(content='Sessione esplorativa: {riepilogo}', category='session', importance=6, tags=['session:classified','session:exploration'])"
+            "prompt": "CLASSIFICA INTENZIONE — primo messaggio della sessione:\n\nPRIMA di classificare, verifica se esiste già una classificazione per questa sessione:\nsearch_memory(tag='session:classified', limit=5)\nSe trovi una memoria con tag 'session:classified', INTERROMPI — la classificazione è già stata fatta.\n\nAltrimenti, analizza il prompt utente e classifica lo scopo della sessione:\n\n- Se contiene 'refactor|migrate|upgrade|ristruttura' → remember(content='Sessione di refactoring', category='session', importance=6, tags=['session:classified','session:refactoring'])\n- Se contiene 'bug|fix|errore|non funziona' → remember(content='Sessione di bugfix', category='session', importance=6, tags=['session:classified','session:bugfix'])\n- Se contiene 'feature|implementa|crea|aggiungi|nuova' → remember(content='Sessione di sviluppo', category='session', importance=6, tags=['session:classified','session:feature'])\n- Se contiene 'deploy|release|pubblica' → remember(content='Sessione di deploy', category='session', importance=6, tags=['session:classified','session:deploy'])\n- default → remember(content='Sessione esplorativa', category='session', importance=6, tags=['session:classified','session:exploration'])"
           }
         ]
       }
@@ -124,7 +120,7 @@
         "actions": [
           {
             "type": "prompt",
-            "prompt": "TOOL FALLITO — REGISTRAZIONE:\n\nUn tool ha fallito. Chiama remember() sul source memory:\n\nremember(content='Tool fallito: {descrivi errore}', category='bugfix', importance=6, tags=['agentic:tool-failure', 'monitoraggio'])\n\nSe lo stesso tool fallisce 3+ volte nella stessa sessione:\n- add_open_loop(title='Tool {nome} fallisce ripetutamente', priority='high')\n- Aggiungi tag 'agentic:critical-failure'"
+            "prompt": "TOOL FALLITO — REGISTRAZIONE:\n\n1. Cerca quante volte questo tool è già fallito oggi:\n   search_memory(tag='agentic:tool-failure', limit=20)\n   Conta le memorie per lo stesso tool.\n\n2. Registra il fallimento:\n   remember(content='Tool fallito', category='bugfix', importance=6, tags=['agentic:tool-failure', 'monitoraggio'])\n\n3. Se il conteggio dal passo 1 è >= 3 (questo è il 4+ fallimento), APRI UN OPEN LOOP:\n   add_open_loop(title='Tool fallisce ripetutamente', priority='high', description='Aprire sessione dedicata per diagnosticare')\n   E aggiungi: remember(content='Fallimenti critici accumulati', category='bugfix', importance=8, tags=['agentic:critical-failure', 'monitoraggio'])"
           }
         ]
       }
@@ -132,11 +128,12 @@
     "TaskCompleted": [
       {
         "name": "Agentic: Track Task Completion",
+        "matcher": "*",
         "permissionMode": "allow-all",
         "actions": [
           {
             "type": "prompt",
-            "prompt": "TASK COMPLETATO — REGISTRAZIONE:\n\nUn task è stato completato. Se il task è significativo:\n\nremember(content='Task completato: {descrivi obiettivo del task}', category='feature', importance=5, tags=['agentic:task-completed', 'monitoraggio'])\n\nSe il task faceva parte di un open loop aperto, chiudilo: close_open_loop(id=..., resolution='Completato in questa sessione')."
+            "prompt": "TASK COMPLETATO — REGISTRAZIONE:\n\nValuta se il task completato è SIGNIFICATIVO (completamento di una fase, non un micro-step).\n\nCriteri per considerarlo significativo:\n- Ha richiesto più strumenti/tool\n- Ha prodotto file o modifiche\n- Faceva parte di un open loop\n- È durato più di pochi secondi\n\nSe è significativo:\n  remember(content='Task completato', category='feature', importance=5, tags=['agentic:task-completed', 'monitoraggio'])\n  - Cerca se esiste un open loop correlato: list_open_loops()\n  - Se trovi un match, chiudilo: close_open_loop(id=..., resolution='Completato')\n\nSe è un micro-task banale (es. lettura file, risposta semplice), SALTA — non salvare."
           }
         ]
       }
@@ -148,7 +145,7 @@
         "actions": [
           {
             "type": "prompt",
-            "prompt": "AGENTE INATTIVO RILEVATO:\n\nUn agente è inattivo. Possibili cause: tool lento, bloccato su decisione, in attesa di input.\n\nChiama sul source memory:\nadd_open_loop(title='Agente inattivo rilevato — verificare stato', description='TeammateIdle event ricevuto.', priority='high')\n\nSe capita >3 volte/ora, registra:\nremember(content='Blocchi frequenti: {conta eventi}', category='note', importance=7, tags=['agentic:idle', 'monitoraggio'])"
+            "prompt": "AGENTE INATTIVO RILEVATO:\n\nUn agente è inattivo. Possibili cause: tool lento, bloccato su decisione, in attesa di input.\n\n1. Conta eventi di inattività recenti:\n   search_memory(tag='agentic:idle', limit=20)\n   Se il conteggio è >= 3, siamo in presenza di blocchi frequenti.\n\n2. Se è la prima volta nell'ultima ora:\n   add_open_loop(title='Agente inattivo rilevato — verificare stato', description='TeammateIdle event ricevuto.', priority='high')\n\n3. Se il conteggio dal passo 1 è >= 3 (blocchi frequenti):\n   remember(content='Blocchi frequenti rilevati', category='note', importance=7, tags=['agentic:idle', 'monitoraggio'])"
           }
         ]
       }
@@ -160,7 +157,7 @@
         "actions": [
           {
             "type": "prompt",
-            "prompt": "PERMESSO NEGATO — REGISTRAZIONE:\n\nUn permesso è stato negato.\n\nPrima volta per questo tool:\nremember(content='Permesso negato per {tool}', category='note', importance=5, tags=['agentic:permission-denied', 'monitoraggio'])\n\nSe >3 PermissionDenied per stesso tool nella sessione:\nadd_open_loop(title='Tool {nome} bloccato da permessi', priority='medium', description='Considera eccezione permesso per tool fidato')"
+            "prompt": "PERMESSO NEGATO — REGISTRAZIONE:\n\n1. Cerca quante volte questo tipo di permesso è stato negato:\n   search_memory(tag='agentic:permission-denied', limit=20)\n   Conta le occorrenze recenti.\n\n2. Se il conteggio è 0 o 1 (prime volte):\n   remember(content='Permesso negato', category='note', importance=5, tags=['agentic:permission-denied', 'monitoraggio'])\n\n3. Se il conteggio >= 3 (blocco ricorrente):\n   add_open_loop(title='Tool bloccato da permessi', priority='medium', description='Valuta se aggiungere eccezione permesso per questo tool')\n   remember(content='Permesso negato (blocco ricorrente)', category='note', importance=6, tags=['agentic:permission-denied', 'agentic:bottleneck'])"
           }
         ]
       }
