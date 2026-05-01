@@ -236,10 +236,29 @@ const DiffRow = ({ e }) => {
 };
 
 const TimelineChart = () => {
-  const { TIMELINE } = window.CRAFT;
+  const memories = window.CRAFT.MEMORIES || [];
+  const DAYS = 30;
+  const now = Date.now();
+  const day = 86400000;
+  const buckets = Array.from({ length: DAYS }, (_, i) => {
+    const start = now - (DAYS - 1 - i) * day;
+    const end = start + day;
+    const count = memories.filter(m => m.ts >= start && m.ts < end).length;
+    const decay = 0.3 + (i / (DAYS - 1)) * 0.7;
+    return { count, decay };
+  });
+  const max = Math.max(...buckets.map(t => t.count), 1);
   const W = 700, H = 120, P = 8;
-  const max = Math.max(...TIMELINE.map(t => t.count));
-  const bw = (W - P*2) / TIMELINE.length;
+  const bw = (W - P * 2) / DAYS;
+
+  if (memories.length === 0) {
+    return (
+      <div style={{ height: H, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--ink-3)", fontSize: 12, fontFamily: "var(--font-mono)" }}>
+        No memories yet
+      </div>
+    );
+  }
+
   return (
     <svg className="timeline-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
       <defs>
@@ -248,37 +267,38 @@ const TimelineChart = () => {
           <stop offset="1" stopColor="var(--accent)" stopOpacity="0.05" />
         </linearGradient>
       </defs>
-      {/* gridlines */}
       {[0.25, 0.5, 0.75].map(p => (
-        <line key={p} x1={P} x2={W-P} y1={H*p} y2={H*p} stroke="var(--line)" strokeWidth="1" strokeDasharray="2 4" />
+        <line key={p} x1={P} x2={W - P} y1={H * p} y2={H * p} stroke="var(--line)" strokeWidth="1" strokeDasharray="2 4" />
       ))}
-      {/* bars (count) */}
-      {TIMELINE.map((t, i) => {
-        const h = (t.count / max) * (H - P*2 - 16);
-        const x = P + i*bw;
-        const opacity = t.decay;
+      {buckets.map((t, i) => {
+        const h = (t.count / max) * (H - P * 2 - 16);
+        const x = P + i * bw;
         return (
           <g key={i}>
-            <rect x={x+1} y={H-P-h} width={bw-2} height={h} fill="url(#tl-grad)" opacity={0.4 + opacity*0.6} />
-            <rect x={x+1} y={H-P-h} width={bw-2} height={1.2} fill="var(--accent)" opacity={opacity} />
+            <rect x={x + 1} y={H - P - h} width={bw - 2} height={h} fill="url(#tl-grad)" opacity={0.4 + t.decay * 0.6} />
+            {h > 0 && <rect x={x + 1} y={H - P - h} width={bw - 2} height={1.2} fill="var(--accent)" opacity={t.decay} />}
           </g>
         );
       })}
-      {/* decay curve */}
-      <path
-        d={`M ${P} ${H-P-((TIMELINE[0].decay) * (H-P*2-16))} ` + TIMELINE.map((t, i) => `L ${P + i*bw + bw/2} ${H-P-((t.decay) * (H-P*2-16))}`).join(" ")}
-        stroke="var(--accent-2)" strokeWidth="1.2" fill="none" strokeDasharray="3 3" opacity="0.7"
-      />
-      <text x={P+4} y={14} fontSize="9" fill="var(--ink-3)" fontFamily="var(--font-mono)">29d ago</text>
-      <text x={W-P-30} y={14} fontSize="9" fill="var(--ink-3)" fontFamily="var(--font-mono)">today</text>
+      <text x={P + 4} y={14} fontSize="9" fill="var(--ink-3)" fontFamily="var(--font-mono)">29d ago</text>
+      <text x={W - P - 30} y={14} fontSize="9" fill="var(--ink-3)" fontFamily="var(--font-mono)">today</text>
     </svg>
   );
 };
 
 const HeatmapView = () => {
-  const { CATEGORIES, SCOPES, HEATMAP } = window.CRAFT;
+  const { CATEGORIES, SCOPES } = window.CRAFT;
+  const memories = window.CRAFT.MEMORIES || [];
+  // Compute heatmap from real memories
+  const HEATMAP = {};
+  CATEGORIES.forEach(c => {
+    HEATMAP[c.id] = {};
+    SCOPES.forEach(s => {
+      HEATMAP[c.id][s] = memories.filter(m => m.category === c.id && m.scope === s).length;
+    });
+  });
   const allVals = CATEGORIES.flatMap(c => SCOPES.map(s => HEATMAP[c.id][s]));
-  const max = Math.max(...allVals);
+  const max = Math.max(...allVals, 1);
   return (
     <div className="heat-grid">
       <div className="heat-h" />

@@ -66,10 +66,18 @@ const App = () => {
   const [connected, setConnected] = useState(null);
   const [liveStats, setLiveStats] = useState(null);
   const [configOpen, setConfigOpen] = useState(false);
+  const [wsId, setWsId] = useState(window.__CRAFT_CONFIG?.workspaceId || "");
 
   // ─── Initial data load ─────────────────────────────────────────────
   const loadData = useCallback(async () => {
     try {
+      // Auto-detect workspace from server health
+      const health = await CRAFT_API.health();
+      if (health.workspace) {
+        window.__CRAFT_CONFIG = { ...window.__CRAFT_CONFIG, workspaceId: health.workspace };
+        setWsId(health.workspace);
+      }
+
       const [stats, memories, facts, loops] = await Promise.all([
         CRAFT_API.stats(),
         CRAFT_API.recentMemories(null, 50),
@@ -203,7 +211,7 @@ const App = () => {
             </span>
           </span>
           <span>·</span>
-          <span title="Workspace ID" style={{ cursor: "default" }}>{cfg.workspaceId || "default"}</span>
+          <span title="Workspace ID" style={{ cursor: "default" }}>{wsId || cfg.workspaceId || "—"}</span>
           <span>·</span>
           <button
             onClick={() => setConfigOpen(true)}
@@ -272,7 +280,7 @@ const App = () => {
         <span className="sep" />
         <span>BM25 autolink &lt; -2.5</span>
         <span style={{ marginLeft: "auto", color: "var(--ink-3)", fontFamily: "var(--font-mono)", fontSize: 11 }}>
-          ws: {cfg.workspaceId || "default"}
+          ws: {wsId || cfg.workspaceId || "—"}
         </span>
       </footer>
 

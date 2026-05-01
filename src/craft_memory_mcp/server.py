@@ -1594,11 +1594,17 @@ def export_session_traces(min_score: float = 0.0, limit: int = 50) -> str:
 
 # ─── REST API layer for Craft Memory UI (browser-friendly endpoints) ──
 
+def _resolve_ws(raw: str | None) -> str:
+    """Map empty/default workspace_id to the server's configured WORKSPACE_ID."""
+    if not raw or raw.strip() in ("", "default"):
+        return WORKSPACE_ID
+    return raw.strip()
+
 @mcp.custom_route("/api/stats", methods=["GET"])
 async def api_stats(request):
     """Workspace stats summary for UI dashboard."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     conn = _get_conn()
     stats = _db_get_memory_stats(conn, ws)
     return JSONResponse(stats)
@@ -1608,7 +1614,7 @@ async def api_stats(request):
 async def api_recent_memories(request):
     """Recent memories ranked by importance × time-decay."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     scope = request.query_params.get("scope") or None
     limit = min(int(request.query_params.get("limit", "20")), 100)
     conn = _get_conn()
@@ -1620,7 +1626,7 @@ async def api_recent_memories(request):
 async def api_search_memories(request):
     """Hybrid BM25+Jaccard RRF search. Falls back to recent when no query."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     query = request.query_params.get("q", "").strip()
     scope = request.query_params.get("scope") or None
     limit = min(int(request.query_params.get("limit", "20")), 100)
@@ -1636,7 +1642,7 @@ async def api_search_memories(request):
 async def api_facts(request):
     """God facts ranked by confidence × type_bonus × mentions."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     top_n = min(int(request.query_params.get("top_n", "15")), 50)
     conn = _get_conn()
     results = _db_god_facts(conn, ws, top_n)
@@ -1647,7 +1653,7 @@ async def api_facts(request):
 async def api_loops_get(request):
     """List open loops filtered by scope and status."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     scope = request.query_params.get("scope") or None
     status = request.query_params.get("status", "open")
     conn = _get_conn()
@@ -1660,7 +1666,7 @@ async def api_loops_post(request):
     """Create a new open loop from the UI."""
     from starlette.responses import JSONResponse
     body = await request.json()
-    ws = body.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(body.get("workspace_id"))
     title = (body.get("title") or "").strip()
     if not title:
         return JSONResponse({"error": "title required"}, status_code=400)
@@ -1678,7 +1684,7 @@ async def api_diff(request):
     """Memory diff since a given epoch. Defaults to last 24h."""
     import time
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     since_default = int(time.time()) - 86400
     since = int(request.query_params.get("since", str(since_default)))
     conn = _get_conn()
@@ -1690,7 +1696,7 @@ async def api_diff(request):
 async def api_relations(request):
     """Get graph relations for a memory node."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     memory_id_str = request.query_params.get("memory_id", "0")
     direction = request.query_params.get("direction", "both")
     if not memory_id_str or not memory_id_str.isdigit():
@@ -1705,7 +1711,7 @@ async def api_remember(request):
     """Store a new memory from the UI."""
     from starlette.responses import JSONResponse
     body = await request.json()
-    ws = body.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(body.get("workspace_id"))
     content = _strip_private(body.get("content", ""))
     if not content:
         return JSONResponse({"error": "empty content"}, status_code=400)
@@ -1738,7 +1744,7 @@ async def api_close_loop(request):
 async def api_handoff(request):
     """Generate a structured session handoff pack."""
     from starlette.responses import JSONResponse
-    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
     scope = request.query_params.get("scope") or None
     conn = _get_conn()
     pack = _db_generate_handoff(conn, ws, scope=scope)
@@ -1764,9 +1770,22 @@ def run_server():
         )
         from pathlib import Path
         from starlette.staticfiles import StaticFiles
+
+        class NoCacheStaticFiles(StaticFiles):
+            """StaticFiles that adds no-cache headers at ASGI level (no buffering)."""
+            async def __call__(self, scope, receive, send):
+                async def send_no_cache(message):
+                    if message["type"] == "http.response.start":
+                        headers = list(message.get("headers", []))
+                        headers.append((b"cache-control", b"no-cache, no-store, must-revalidate"))
+                        headers.append((b"pragma", b"no-cache"))
+                        message = {**message, "headers": headers}
+                    await send(message)
+                await super().__call__(scope, receive, send_no_cache)
+
         _ui_dir = Path(__file__).parent.parent.parent / "Craft-Memory-UI"
         if _ui_dir.exists():
-            app.mount("/ui", StaticFiles(directory=str(_ui_dir), html=True), name="ui")
+            app.mount("/ui", NoCacheStaticFiles(directory=str(_ui_dir), html=True), name="ui")
             print(f"[craft-memory] UI:       http://{MCP_HOST}:{MCP_PORT}/ui/", flush=True)
         uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
     else:

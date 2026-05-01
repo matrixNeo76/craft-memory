@@ -4,7 +4,7 @@
 
   const DEFAULTS = {
     serverUrl: "http://127.0.0.1:8392",
-    workspaceId: "default",
+    workspaceId: "",
   };
 
   function load() {
@@ -23,6 +23,7 @@
   window.__CRAFT_CONFIG = load();
   window.__CRAFT_CONFIG_SAVE = save;
   window.__CRAFT_CONFIG_LOAD = load;
+  window.__CRAFT_CONFIG_VER = 3;
 
   // ─── Config Modal component ──────────────────────────────────────────
   window.ConfigModal = function ({ onClose }) {

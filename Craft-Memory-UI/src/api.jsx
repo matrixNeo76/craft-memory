@@ -1,7 +1,7 @@
 // Craft Memory — API client (all server communication goes through here)
 (function () {
   const base = () => (window.__CRAFT_CONFIG?.serverUrl || "http://127.0.0.1:8392").replace(/\/$/, "");
-  const ws   = () =>  window.__CRAFT_CONFIG?.workspaceId || "default";
+  const ws   = () =>  window.__CRAFT_CONFIG?.workspaceId || "";
 
   function buildQs(params) {
     const p = { workspace_id: ws(), ...params };
