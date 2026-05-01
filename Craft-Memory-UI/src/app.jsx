@@ -281,8 +281,8 @@ const App = () => {
         <div className="main-inner">
           {route === "home"      && <HomeScreen      onNavigate={navigate} />}
           {route === "dashboard" && <DashboardScreen onNavigate={navigate} />}
-          {route === "explorer"  && <ExplorerScreen  onNavigate={navigate} />}
-          {route === "graph"     && <GraphScreen     onNavigate={navigate} focusId={routeArgs.focusId} />}
+          {route === "explorer"  && <ExplorerScreen  onNavigate={navigate} action={routeArgs.action} />}
+          {route === "graph"     && <GraphScreen     onNavigate={navigate} focusId={routeArgs.focusId} action={routeArgs.action} />}
           {route === "loops"     && <LoopsScreen     onNavigate={navigate} />}
           {route === "handoff"   && <HandoffScreen   onNavigate={navigate} />}
           {route === "diff"      && <DiffScreen      onNavigate={navigate} />}

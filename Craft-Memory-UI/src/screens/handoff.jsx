@@ -41,6 +41,41 @@ const HandoffScreen = ({ onNavigate }) => {
   const summary = handoffData?.summary ||
     "No handoff summary available. Call generate_handoff() from the MCP client to produce one.";
 
+  // ─── Copy as Markdown ────────────────────────────────────────────────
+  const [copied, setCopied] = React.useState(false);
+  const buildMarkdown = () => {
+    const lines = [
+      `# Session Handoff — ${sess.id}`,
+      `**Date:** ${sess.date} · **Duration:** ${sess.duration} · **Model:** ${sess.model}`,
+      `**Memories added:** ${sess.memoriesAdded} · **Facts learned:** ${sess.factsLearned} · **Loops opened:** ${sess.loopsOpened} · **Loops closed:** ${sess.loopsClosed}`,
+      ``,
+      `## Summary`,
+      summary,
+      ``,
+      `## Decisions`,
+      ...decisions.map(m => `- ${m.content}\n  *(ref: #${m.id} · scope: ${m.scope} · importance: ${m.importance.toFixed(2)}${m.isCore ? " · core" : "})*`),
+      ``,
+      `## Discoveries`,
+      ...discoveries.map(m => `- ${m.content}\n  *(ref: #${m.id} · scope: ${m.scope})*`),
+      ``,
+      `## Facts Learned`,
+      ...FACTS.slice(0, 3).map(f => `- **${f.key}** = ${f.value} *(scope: ${f.scope} · confidence: ${f.confidence.toFixed(2)})*`),
+      ``,
+      `## Open Loops`,
+      ...openLoops.map(l => `- [${l.priority.toUpperCase()}] **#${l.id}** · ${l.title} *(age: ${l.age}d)*`),
+      ``,
+      `## Next Steps`,
+      ...nextSteps.map((s, i) => `${i+1}. ${s.text || s}`),
+    ];
+    return lines.join("\n");
+  };
+  const copyMarkdown = () => {
+    navigator.clipboard.writeText(buildMarkdown()).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => alert("Clipboard API unavailable — copy failed"));
+  };
+
   return (
     <div className="hand">
       <style>{`
@@ -80,8 +115,12 @@ const HandoffScreen = ({ onNavigate }) => {
           <div className="sub">structured continuation document · save_summary() output</div>
         </div>
         <div className="row gap-12">
-          <button className="btn ghost"><Icon name="external" /> Copy markdown</button>
-          <button className="btn primary"><Icon name="play" /> Start next session with this</button>
+          <button className="btn ghost" onClick={copyMarkdown}>
+            <Icon name="external" /> {copied ? "Copied!" : "Copy markdown"}
+          </button>
+          <button className="btn primary" onClick={() => alert("generate_handoff() — use the MCP client to generate a full handoff and start the next session.")}>
+            <Icon name="play" /> Start next session with this
+          </button>
         </div>
       </div>
 
@@ -181,7 +220,7 @@ const HandoffScreen = ({ onNavigate }) => {
         </div>
 
         <div className="copy-row">
-          <button className="btn"><Icon name="external" /> Copy as markdown</button>
+          <button className="btn" onClick={copyMarkdown}><Icon name="external" /> {copied ? "Copied!" : "Copy as markdown"}</button>
           <button className="btn ghost" onClick={() => onNavigate("loops")}><Icon name="loops" /> Open loops</button>
           <button className="btn ghost" onClick={() => onNavigate("explorer")}><Icon name="search" /> Search referenced</button>
         </div>

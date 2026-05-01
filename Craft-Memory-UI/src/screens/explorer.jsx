@@ -1,20 +1,65 @@
-// Memory Explorer — search FTS5-style + filters + result list
-const ExplorerScreen = ({ onNavigate }) => {
+// Memory Explorer — FTS5-backed hybrid search + filters + result list
+const ExplorerScreen = ({ onNavigate, action }) => {
   const { MEMORIES, CATEGORIES, SCOPES, formatRelTime } = window.CRAFT;
-  const [query, setQuery] = React.useState("");
+
+  const [query, setQuery]           = React.useState("");
   const [activeCats, setActiveCats] = React.useState(new Set());
   const [activeScope, setActiveScope] = React.useState("all");
-  const [coreOnly, setCoreOnly] = React.useState(false);
-  const [sortBy, setSortBy] = React.useState("rrf");
+  const [coreOnly, setCoreOnly]     = React.useState(false);
+  const [sortBy, setSortBy]         = React.useState("rrf");
+
+  // ─── Server-side search state ──────────────────────────────────────
+  const [searchResults, setSearchResults] = React.useState(null); // null = use local
+  const [searching, setSearching]         = React.useState(false);
+  const [searchError, setSearchError]     = React.useState(null);
+
+  // ─── "Remember" modal state ─────────────────────────────────────────
+  const [showRemember, setShowRemember] = React.useState(false);
+
+  const inputRef = React.useRef(null);
+
+  // React to routeArgs.action from sidebar MCP tool clicks
+  React.useEffect(() => {
+    if (action === "search") {
+      inputRef.current?.focus();
+    } else if (action === "remember") {
+      setShowRemember(true);
+    }
+  }, [action]);
 
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
 
+  // ─── Debounced FTS5 server search ──────────────────────────────────
+  React.useEffect(() => {
+    if (!query.trim()) {
+      setSearchResults(null);
+      setSearchError(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setSearching(true);
+      setSearchError(null);
+      CRAFT_API.searchMemories(query.trim(), activeScope !== "all" ? activeScope : null, 100)
+        .then((rows) => setSearchResults(rows))
+        .catch((e) => {
+          console.warn("[explorer] search failed:", e.message);
+          setSearchError(e.message);
+          setSearchResults(null); // fallback to local
+        })
+        .finally(() => setSearching(false));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [query, activeScope]);
+
+  // ─── Filtered list (server results or local fallback) ───────────────
+  const baseList = query.trim() && searchResults !== null ? searchResults : MEMORIES;
   const filtered = React.useMemo(() => {
-    let out = MEMORIES.filter(m => {
+    let out = baseList.filter(m => {
       if (activeCats.size > 0 && !activeCats.has(m.category)) return false;
       if (activeScope !== "all" && m.scope !== activeScope) return false;
       if (coreOnly && !m.isCore) return false;
-      if (query.trim()) {
+      // Local fallback filtering only when not using server results
+      if (query.trim() && searchResults === null) {
         const q = query.toLowerCase();
         const hay = (m.content + " " + m.tags.join(" ")).toLowerCase();
         if (!hay.includes(q)) return false;
@@ -24,7 +69,7 @@ const ExplorerScreen = ({ onNavigate }) => {
     if (sortBy === "importance") out = [...out].sort((a, b) => b.importance - a.importance);
     else if (sortBy === "recent") out = [...out].sort((a, b) => b.ts - a.ts);
     return out;
-  }, [query, activeCats, activeScope, coreOnly, sortBy]);
+  }, [query, searchResults, activeCats, activeScope, coreOnly, sortBy]);
 
   const highlight = (text, q) => {
     if (!q.trim()) return text;
@@ -39,6 +84,9 @@ const ExplorerScreen = ({ onNavigate }) => {
     setActiveCats(next);
   };
 
+  const usingServerSearch = query.trim() && searchResults !== null;
+  const totalDb = window.CRAFT.STATS.memoriesTotal;
+
   return (
     <div className="exp">
       <style>{`
@@ -52,6 +100,8 @@ const ExplorerScreen = ({ onNavigate }) => {
         .exp-search .syntax { color: var(--accent); margin-right: 4px; }
         .exp-search .clear { color: var(--ink-3); cursor: pointer; padding: 2px; }
         .exp-search .clear:hover { color: var(--ink-1); }
+        .exp-search .search-spinner { width: 12px; height: 12px; border: 1.5px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; flex-none; }
+        @keyframes spin { to { transform: rotate(360deg); } }
         .exp-side { display: flex; flex-direction: column; gap: 16px; }
         .filter-block { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--radius); }
         .filter-h { padding: 10px 14px; font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-3); border-bottom: 1px solid var(--line); }
@@ -87,25 +137,61 @@ const ExplorerScreen = ({ onNavigate }) => {
         .res-rank .bar { width: 60px; height: 3px; background: var(--bg-3); border-radius: 2px; overflow: hidden; }
         .res-rank .bar > div { height: 100%; background: var(--accent); }
         .empty-state { padding: 60px 20px; text-align: center; color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; }
+        .search-badge { padding: 2px 8px; border-radius: 999px; font-family: var(--font-mono); font-size: 10px; background: var(--accent-soft); color: var(--accent); border: 1px solid oklch(0.78 0.18 var(--accent-h) / 0.3); }
+        .search-err { padding: 8px 14px; font-family: var(--font-mono); font-size: 11px; color: var(--critical); border-bottom: 1px solid var(--line); }
+        /* ── InsertMemoryModal ── */
+        .imm-overlay { position: fixed; inset: 0; background: rgba(5,7,13,0.82); display: flex; align-items: center; justify-content: center; z-index: 2000; backdrop-filter: blur(4px); }
+        .imm-box { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 28px; width: 520px; display: flex; flex-direction: column; gap: 18px; box-shadow: var(--glow); }
+        .imm-title { font-size: 14px; font-weight: 500; color: var(--ink-0); display: flex; align-items: center; justify-content: space-between; }
+        .imm-title button { background: none; border: none; color: var(--ink-3); cursor: pointer; font-size: 22px; line-height: 1; padding: 2px; }
+        .imm-field { display: flex; flex-direction: column; gap: 6px; }
+        .imm-label { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.1em; }
+        .imm-textarea { background: var(--bg-1); border: 1px solid var(--line-2); border-radius: var(--radius-sm); padding: 10px 12px; color: var(--ink-0); font: 13px/1.55 var(--font-ui); outline: none; resize: vertical; min-height: 100px; }
+        .imm-textarea:focus { border-color: var(--accent); }
+        .imm-select { background: var(--bg-1); border: 1px solid var(--line-2); border-radius: var(--radius-sm); padding: 7px 10px; color: var(--ink-0); font: 12px var(--font-mono); outline: none; }
+        .imm-select:focus { border-color: var(--accent); }
+        .imm-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+        .imm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+        .imm-saving { opacity: 0.5; pointer-events: none; }
       `}</style>
+
+      {/* ── Insert Memory Modal ────────────────────────────────────────── */}
+      {showRemember && (
+        <InsertMemoryModal
+          onClose={() => setShowRemember(false)}
+          onSaved={(mem) => {
+            // Prepend to global MEMORIES so Dashboard/Explorer reflect it
+            window.CRAFT.MEMORIES = [mem, ...window.CRAFT.MEMORIES];
+            setShowRemember(false);
+          }}
+        />
+      )}
 
       <div className="exp-h">
         <div>
           <h1>Memory Explorer</h1>
-          <div className="sub">RRF hybrid search · FTS5 BM25 + Jaccard fused via 1/(k+rank), k=60</div>
+          <div className="sub">
+            RRF hybrid search · FTS5 BM25 + Jaccard · {totalDb.toLocaleString()} total in DB
+          </div>
         </div>
+        <button className="btn primary" onClick={() => setShowRemember(true)}>
+          <Icon name="plus" /> remember()
+        </button>
       </div>
 
       <div className="exp-search" style={{ gridColumn: "1 / -1" }}>
         <Icon name="search" />
         <span className="syntax mono">search_memory(</span>
         <input
+          ref={inputRef}
           placeholder='"transport" OR scope:project tag:fts5'
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           autoFocus
         />
         <span className="syntax mono">)</span>
+        {searching && <span className="search-spinner" />}
+        {usingServerSearch && !searching && <span className="search-badge">FTS5</span>}
         {query && <span className="clear" onClick={() => setQuery("")}><Icon name="x" size={12} /></span>}
         <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "2px 5px", borderRadius: 3, border: "1px solid var(--line)" }}>↵</kbd>
       </div>
@@ -157,7 +243,8 @@ const ExplorerScreen = ({ onNavigate }) => {
         <div className="results-h">
           <span className="count-big">{filtered.length}</span>
           <span>results</span>
-          {query && <span>· matched <span className="mono" style={{ color: "var(--accent)" }}>"{query}"</span></span>}
+          {usingServerSearch && <span>· <span className="mono" style={{ color: "var(--accent)" }}>FTS5 "{query}"</span></span>}
+          {!usingServerSearch && query && <span>· local filter <span className="mono" style={{ color: "var(--ink-3)" }}>"{query}"</span></span>}
           <div className="sort-pills">
             <span className={"sort-pill" + (sortBy === "rrf" ? " on" : "")} onClick={() => setSortBy("rrf")}>rrf rank</span>
             <span className={"sort-pill" + (sortBy === "importance" ? " on" : "")} onClick={() => setSortBy("importance")}>importance</span>
@@ -165,9 +252,15 @@ const ExplorerScreen = ({ onNavigate }) => {
           </div>
         </div>
 
+        {searchError && (
+          <div className="search-err">⚠ Server search failed: {searchError} — showing local results</div>
+        )}
+
         <div>
           {filtered.length === 0 && (
-            <div className="empty-state">No results · try clearing filters or relaxing the query</div>
+            <div className="empty-state">
+              {searching ? "Searching…" : "No results · try clearing filters or relaxing the query"}
+            </div>
           )}
           {filtered.map((m, i) => (
             <div key={m.id} className="res-card" onClick={() => onNavigate("graph", { focusId: m.id })}>
@@ -194,6 +287,115 @@ const ExplorerScreen = ({ onNavigate }) => {
               </div>
             </div>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Insert Memory Modal ─────────────────────────────────────────────────────
+const InsertMemoryModal = ({ onClose, onSaved }) => {
+  const [content, setContent]   = React.useState("");
+  const [category, setCategory] = React.useState("note");
+  const [scope, setScope]       = React.useState("workspace");
+  const [importance, setImportance] = React.useState(5);
+  const [isCore, setIsCore]     = React.useState(false);
+  const [tags, setTags]         = React.useState("");
+  const [saving, setSaving]     = React.useState(false);
+  const [error, setError]       = React.useState(null);
+
+  const { CATEGORIES, SCOPES } = window.CRAFT;
+
+  const save = () => {
+    if (!content.trim() || saving) return;
+    setSaving(true);
+    setError(null);
+    const tagList = tags.split(",").map(t => t.trim()).filter(Boolean);
+    CRAFT_API.remember({
+      content: content.trim(),
+      category,
+      scope,
+      importance,
+      is_core: isCore,
+      tags: tagList,
+    })
+      .then((res) => onSaved(res))
+      .catch((e) => { setError(e.message); setSaving(false); });
+  };
+
+  return (
+    <div className="imm-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className={`imm-box${saving ? " imm-saving" : ""}`}>
+        <div className="imm-title">
+          <span><span style={{ color: "var(--accent)", fontFamily: "var(--font-mono)" }}>remember()</span> — New memory</span>
+          <button onClick={onClose}>×</button>
+        </div>
+
+        <div className="imm-field">
+          <div className="imm-label">Content</div>
+          <textarea
+            className="imm-textarea"
+            placeholder="What should the agent remember?"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            autoFocus
+            onKeyDown={(e) => { if (e.key === "Enter" && e.metaKey) save(); }}
+          />
+        </div>
+
+        <div className="imm-row">
+          <div className="imm-field">
+            <div className="imm-label">Category</div>
+            <select className="imm-select" value={category} onChange={(e) => setCategory(e.target.value)}>
+              {CATEGORIES.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+          </div>
+          <div className="imm-field">
+            <div className="imm-label">Scope</div>
+            <select className="imm-select" value={scope} onChange={(e) => setScope(e.target.value)}>
+              {SCOPES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div className="imm-field">
+            <div className="imm-label">Importance (1–10)</div>
+            <select className="imm-select" value={importance} onChange={(e) => setImportance(Number(e.target.value))}>
+              {[1,2,3,4,5,6,7,8,9,10].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="imm-field">
+          <div className="imm-label">Tags (comma-separated)</div>
+          <input
+            className="imm-select"
+            style={{ width: "100%" }}
+            placeholder="fts5, architecture, decision"
+            value={tags}
+            onChange={(e) => setTags(e.target.value)}
+          />
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span
+            className={"switch" + (isCore ? " on" : "")}
+            onClick={() => setIsCore(!isCore)}
+            style={{ cursor: "pointer" }}
+          />
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink-1)" }}>
+            Mark as Core (immune to decay)
+          </span>
+        </div>
+
+        {error && <div style={{ color: "var(--critical)", fontFamily: "var(--font-mono)", fontSize: 12 }}>Error: {error}</div>}
+
+        <div className="imm-actions">
+          <button className="btn ghost" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={save} disabled={!content.trim() || saving}>
+            {saving ? "Saving…" : <><Icon name="plus" /> Save memory</>}
+          </button>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", alignSelf: "center", marginLeft: 4 }}>
+            ⌘↵
+          </div>
         </div>
       </div>
     </div>

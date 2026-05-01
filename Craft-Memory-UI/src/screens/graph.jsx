@@ -1,27 +1,35 @@
 // Knowledge Graph viewer — force-directed layout, interactive
-const GraphScreen = ({ onNavigate, focusId }) => {
+const GraphScreen = ({ onNavigate, focusId, action }) => {
   const { MEMORIES, CATEGORIES } = window.CRAFT;
   const [relations, setRelations] = React.useState(window.CRAFT.RELATIONS || []);
-  const [loadingRel, setLoadingRel] = React.useState(relations.length === 0);
+  const [loadingRel, setLoadingRel] = React.useState(!window.CRAFT.RELATIONS_LOADED);
   const [selected, setSelected] = React.useState(focusId || null);
   const [hovered, setHovered] = React.useState(null);
   const [activeRoles, setActiveRoles] = React.useState(new Set(["core", "context", "detail", "temporal", "causal"]));
+  const [topBarMsg, setTopBarMsg] = React.useState(null); // for inline button feedback
 
-  // Load relations from backend if not already loaded globally
+  // Load relations from backend only once (flag prevents re-fetch on empty DB)
   React.useEffect(() => {
-    if (relations.length > 0) { setLoadingRel(false); return; }
+    if (window.CRAFT.RELATIONS_LOADED) { setLoadingRel(false); return; }
     CRAFT_API.relations(null, null)
       .then((r) => {
         const edges = Array.isArray(r) ? r : (r?.edges ?? []);
         setRelations(edges);
-        window.CRAFT.RELATIONS = edges; // cache globally
+        window.CRAFT.RELATIONS = edges;         // cache array
+        window.CRAFT.RELATIONS_LOADED = true;   // prevent re-fetch on empty DB
       })
-      .catch((e) => console.warn("[graph] relations load failed:", e.message))
+      .catch((e) => {
+        console.warn("[graph] relations load failed:", e.message);
+        window.CRAFT.RELATIONS_LOADED = true;   // stop retrying even on error
+      })
       .finally(() => setLoadingRel(false));
   }, []);
 
   const RELATIONS = relations;
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
+
+  const showMsg = (msg) => { setTopBarMsg(msg); setTimeout(() => setTopBarMsg(null), 3000); };
+
 
   // Simple deterministic layout — circular by category
   const W = 800, H = 540;
@@ -109,8 +117,13 @@ const GraphScreen = ({ onNavigate, focusId }) => {
           <div className="sub">{MEMORIES.length} nodes · {RELATIONS.length} edges · roles: core, context, detail, temporal, causal</div>
         </div>
         <div className="row gap-12">
-          <button className="btn ghost"><Icon name="link" /> link_memories()</button>
-          <button className="btn ghost"><Icon name="spark" /> find_similar()</button>
+          {topBarMsg && <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--accent)", padding: "4px 10px", background: "var(--accent-soft)", borderRadius: 4 }}>{topBarMsg}</span>}
+          <button className="btn ghost" onClick={() => showMsg("link_memories() — use the MCP client to create typed edges between memories")}>
+            <Icon name="link" /> link_memories()
+          </button>
+          <button className="btn ghost" onClick={() => { onNavigate("explorer", { action: "search" }); }}>
+            <Icon name="spark" /> find_similar()
+          </button>
         </div>
       </div>
 
