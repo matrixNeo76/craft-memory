@@ -102,7 +102,7 @@ const App = () => {
         MEMORIES: memories,
         FACTS:    facts,
         LOOPS:    loops,
-        SESSIONS: [{ id: window.__CRAFT_CONFIG.workspaceId, date: new Date().toISOString().split("T")[0] }],
+        SESSIONS: [{ id: health.workspace || window.__CRAFT_CONFIG.workspaceId, date: new Date().toISOString().split("T")[0] }],
       };
 
       setLiveStats(stats);

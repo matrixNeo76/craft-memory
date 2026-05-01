@@ -38,7 +38,7 @@ const HomeScreen = ({ onNavigate }) => {
       <div className="home-left">
         <div className="home-eyebrow">
           <span className="pulse" />
-          <span>v0.4.2 · Server up · localhost:8392</span>
+          <span>v0.5.0 · Server up · {(window.__CRAFT_CONFIG?.serverUrl || "localhost:8392").replace("http://", "")}</span>
         </div>
         <h1 className="home-h1">
           Persistent neural memory<br />

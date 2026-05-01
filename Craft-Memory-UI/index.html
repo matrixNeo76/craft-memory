@@ -325,6 +325,20 @@
   body.grid-off .bg-binary { display: none; }
 </style>
 
+<!-- XHR cache-buster: forces Babel to bypass Chromium's memory cache for JSX files -->
+<script>
+(function () {
+  var CB = String(Date.now());
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    if (typeof url === 'string' && /\.jsx($|\?)/.test(url)) {
+      url = url.split('?')[0] + '?_cb=' + CB;
+    }
+    return _open.apply(this, arguments);
+  };
+})();
+</script>
+
 <!-- React + Babel -->
 <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>

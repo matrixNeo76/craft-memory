@@ -83,7 +83,7 @@
   // ─── Public API ───────────────────────────────────────────────────────
 
   window.CRAFT_API = {
-    health:          ()              => get("/health"),
+    health:          ()              => fetch(`${base()}/health`, { signal: AbortSignal.timeout(8000) }).then(r => { if (!r.ok) throw new Error(`health ${r.status}`); return r.json(); }),
     stats:           ()              => get("/api/stats"),
     recentMemories:  (scope, limit)  => get("/api/memories/recent", { scope, limit }).then((r) => r.map(normMemory)),
     searchMemories:  (q, scope, lim) => get("/api/memories/search", { q, scope, limit: lim }).then((r) => r.map(normMemory)),

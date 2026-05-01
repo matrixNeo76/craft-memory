@@ -9,7 +9,9 @@
 
   function load() {
     try {
-      return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") };
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      if (saved.workspaceId === "default") delete saved.workspaceId;
+      return { ...DEFAULTS, ...saved };
     } catch {
       return { ...DEFAULTS };
     }
