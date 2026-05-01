@@ -32,6 +32,17 @@ Questo documento delinea i risultati del **secondo audit** del codice sorgente d
 - **Problema:** L'`useEffect` in `graph.jsx` usava il check `if (relations.length > 0) return;` per evitare double-fetching. Tuttavia, se il workspace è nuovo e ci sono oggettivamente 0 relazioni nel DB, il fetch scattava ad ogni mount di `GraphScreen`.
 - [x] **Fix:** Introdotto il flag booleano `window.CRAFT.RELATIONS_LOADED` (settato a `true` sia al successo che all'errore del fetch), il controllo ora è `if (window.CRAFT.RELATIONS_LOADED) return;`. Questo garantisce che il fetch avvenga esattamente una volta per session, indipendentemente dall'effettivo numero di edge nel DB.
 
+### 4. Alert bloccante nativo in `loops.jsx`
+- **Problema:** Il fallback di errore durante l'aggiunta di un loop (`CRAFT_API.addLoop().catch(...)`) usava `alert()` nativo, causando blocchi del thread principale della UI e risultando non coerente con il design estetico del resto dell'interfaccia.
+- [x] **Fix:** Sostituito `alert()` con un aggiornamento dello stato locale `setError()`. L'errore viene ora mostrato inline in un banner dedicato per 4 secondi, offrendo un'esperienza utente molto più integrata.
+
+### 5. `action` ignorata in altri componenti (`DashboardScreen`, `GraphScreen`)
+- **Problema:** Sebbene in `app.jsx` la prop `action` fosse già parzialmente configurata, in `DashboardScreen` non veniva propagata, e `GraphScreen` la riceveva senza consumarla, di fatto vanificando il click dei tool `find_similar` e `maintenance` nella sidebar.
+- [x] **Fix:** 
+  - `app.jsx`: `action` esplicitamente propagata al `<DashboardScreen />`.
+  - `graph.jsx`: Aggiunto `useEffect` per reagire a `action === "find_similar"`, mostrando un tooltip informativo tramite il sistema locale `showMsg`.
+  - `dashboard.jsx`: Aggiunto handler locale per `action === "maintenance"`, anch'esso visivamente presentato in alto a destra tramite uno state `maintenanceMsg`.
+
 ## 🔵 Punti da verificare (Dipendenze dal backend/runtime)
 
 1. **Ricerca Ibrida RRF:** Verificare che l'endpoint backend `/api/memories/search` ritorni i risultati ordinati per rank `rrf`, in modo che l'UI possa semplicemente mapparli così come arrivano senza dover re-implementare logiche di sort complesse.

@@ -30,6 +30,13 @@ const GraphScreen = ({ onNavigate, focusId, action }) => {
 
   const showMsg = (msg) => { setTopBarMsg(msg); setTimeout(() => setTopBarMsg(null), 3000); };
 
+  // React to routeArgs.action from sidebar MCP tool clicks
+  React.useEffect(() => {
+    if (action === "find_similar") {
+      showMsg("find_similar() — type a query in the Explorer to search semantically via FTS5");
+    }
+  }, [action]);
+
 
   // Simple deterministic layout — circular by category
   const W = 800, H = 540;

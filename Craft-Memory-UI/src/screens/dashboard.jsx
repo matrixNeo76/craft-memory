@@ -1,9 +1,18 @@
 // Dashboard — stats hero + recent memories + god_facts + diff stream
-const DashboardScreen = ({ onNavigate }) => {
+const DashboardScreen = ({ onNavigate, action }) => {
   const { STATS, MEMORIES, FACTS, formatRelTime, CATEGORIES } = window.CRAFT;
   const [diffEvents, setDiffEvents] = React.useState(window.CRAFT.DIFF_EVENTS || []);
+  const [maintenanceMsg, setMaintenanceMsg] = React.useState(null);
   const recent = MEMORIES.slice(0, 5);
   const godFacts = [...FACTS].sort((a, b) => b.godScore - a.godScore).slice(0, 6);
+
+  // React to routeArgs.action from sidebar MCP tool clicks
+  React.useEffect(() => {
+    if (action === "maintenance") {
+      setMaintenanceMsg("run_maintenance() — use the MCP client to run the maintenance routine");
+      setTimeout(() => setMaintenanceMsg(null), 3000);
+    }
+  }, [action]);
 
   // Load diff events from backend if not already loaded globally
   React.useEffect(() => {
@@ -19,6 +28,7 @@ const DashboardScreen = ({ onNavigate }) => {
   }, []);
 
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
+
 
   return (
     <div className="dash">

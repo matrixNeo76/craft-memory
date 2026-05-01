@@ -280,7 +280,7 @@ const App = () => {
       <main className="main">
         <div className="main-inner">
           {route === "home"      && <HomeScreen      onNavigate={navigate} />}
-          {route === "dashboard" && <DashboardScreen onNavigate={navigate} />}
+          {route === "dashboard" && <DashboardScreen onNavigate={navigate} action={routeArgs.action} />}
           {route === "explorer"  && <ExplorerScreen  onNavigate={navigate} action={routeArgs.action} />}
           {route === "graph"     && <GraphScreen     onNavigate={navigate} focusId={routeArgs.focusId} action={routeArgs.action} />}
           {route === "loops"     && <LoopsScreen     onNavigate={navigate} />}

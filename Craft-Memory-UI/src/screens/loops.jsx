@@ -62,8 +62,9 @@ const LoopsScreen = ({ onNavigate }) => {
         setDraft({ title: "", priority: "medium" });
         setAdding(false);
       })
-      .catch((e) => alert("Failed to add loop: " + e.message))
+      .catch((e) => { setError("Failed to add loop: " + e.message); setTimeout(() => setError(null), 4000); })
       .finally(() => setSaving(false));
+
   };
 
   const visible = loops.filter((l) => filter === "all" || l.scope === filter);
