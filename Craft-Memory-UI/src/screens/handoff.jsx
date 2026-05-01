@@ -53,7 +53,7 @@ const HandoffScreen = ({ onNavigate }) => {
       summary,
       ``,
       `## Decisions`,
-      ...decisions.map(m => `- ${m.content}\n  *(ref: #${m.id} · scope: ${m.scope} · importance: ${m.importance.toFixed(2)}${m.isCore ? " · core" : "})*`),
+      ...decisions.map(m => { const coreFlag = m.isCore ? " · core" : ""; return `- ${m.content}\n  *(ref: #${m.id} · scope: ${m.scope} · importance: ${m.importance.toFixed(2)}${coreFlag})*`; }),
       ``,
       `## Discoveries`,
       ...discoveries.map(m => `- ${m.content}\n  *(ref: #${m.id} · scope: ${m.scope})*`),
