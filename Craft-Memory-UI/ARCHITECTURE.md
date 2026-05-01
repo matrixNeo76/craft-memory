@@ -64,10 +64,12 @@ Craft-Memory-UI/
 - **Responsive & Dense modes:** The Shell layout adapts to available width, and a "dense" mode can be toggled to compress paddings for data-heavy views.
 - **Icons:** A custom `icons.jsx` file contains all SVG paths, standardizing the visual language without external icon font dependencies.
 
-## 5. Integration with Backend (Python / MCP)
+## 5. Integration with Backend (Python / MCP / REST)
 
-The UI is essentially a visual client for the underlying Craft Memory Python backend.
+The UI is natively served by the `craft-memory` Python backend process and acts as its visual dashboard.
 
+- **Static Serving:** In `craft_memory_mcp/server.py`, a `StaticFiles` route is mounted at `/ui` to serve the `Craft-Memory-UI` directory directly.
+- **REST API:** The Python FastMCP server exposes custom HTTP endpoints (`/api/memories/search`, `/api/loops`, `/api/stats`, etc.) using `@mcp.custom_route(...)`. 
 - **FTS5 Search:** `explorer.jsx` delegates real search queries to the backend's `/api/memories/search` endpoint (powered by SQLite FTS5) instead of filtering locally.
 - **Routing from MCP:** The UI supports deep-linking or action triggering via URL fragments (`#explorer?action=search`), allowing the Agent/MCP server to dynamically push the human user to specific views and actions.
 - **Tool Fallbacks:** Where complex actions are required (e.g., generating a full handoff, linking memories semantically), the UI prompts the user to utilize the MCP client/Agent, acting as an observer to the Agent's actions rather than replicating heavy backend logic in the frontend.

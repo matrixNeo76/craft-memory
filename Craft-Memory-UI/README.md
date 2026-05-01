@@ -2,7 +2,7 @@
 
 Welcome to the frontend interface for **Craft Memory**, a persistent neural memory system for AI agents.
 
-This UI provides a visualization and management layer over the SQLite/FTS5 backend, allowing human operators and agents to inspect memories, manage open loops, view knowledge graphs, and handle session handoffs.
+This UI is natively integrated into the Craft Memory FastMCP server. It provides a visualization and management layer over the SQLite/FTS5 backend, allowing human operators and agents to inspect memories, manage open loops, view knowledge graphs, and handle session handoffs.
 
 ## Philosophy
 
@@ -10,7 +10,7 @@ The Craft Memory UI is designed with a **zero-build-step** philosophy:
 - No Webpack, Vite, or Node.js required.
 - React and Babel are loaded via CDN.
 - JSX is transpiled directly in the browser on-the-fly.
-- You can simply serve the directory with any static HTTP server.
+- The UI is served directly by the Python `craft-memory` HTTP backend (via `StaticFiles`).
 
 This approach ensures maximum portability and simplicity, fitting perfectly into lightweight agentic workflows without requiring complex tooling chains.
 
@@ -25,19 +25,19 @@ This approach ensures maximum portability and simplicity, fitting perfectly into
 
 ## Usage
 
-Since there's no build step, simply serve the `Craft-Memory-UI` directory using any local web server. For example:
+You do **not** need to run a separate web server. 
+When you start the Craft Memory HTTP server:
 
 ```bash
-# Using Python
-python -m http.server 8000
-
-# Using Node.js
-npx serve .
+craft-memory ensure
+# or
+CRAFT_MEMORY_TRANSPORT=http craft-memory serve
 ```
 
-Then open `http://localhost:8000` in your browser.
+The UI is automatically available at:
+👉 **http://127.0.0.1:8392/ui/**
 
-*Note: The UI expects the Craft Memory Python backend API to be running on `http://localhost:8080` (or as configured in `src/config.jsx`).*
+The UI communicates directly with the same Python backend process using custom REST endpoints (`/api/...`) that are mounted alongside the primary `/mcp` endpoints.
 
 ## Documentation
 
