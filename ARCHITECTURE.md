@@ -459,20 +459,23 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 
 ## 5. Automations
 
-4 automations configured in `automations.json`:
+13 automations configured in `automations.json` (expanded 2026-05-01):
 
-### 5.1 SessionStart — "Memory: Recover Session Context"
+### 5.1 SessionStart — "Memory: Recover Session Context (Enhanced)"
 
 **Event**: Session starts
-**Permission**: `allow-all` (required to execute MCP tools without manual user approval)
+**Permission**: `allow-all`
 
 **Steps**:
-1. Runs `python ensure-running.py` → starts server if down
+1. Runs `craft-memory ensure` → starts server if down
 2. Calls `get_recent_memory(scope='workspace', limit=10)`
 3. Calls `list_open_loops()`
-4. Summarizes context for the user
+4. Calls `get_applicable_procedures(current_context='session start', limit=3)` ← **NEW**
+5. Summarizes context for the user
+6. Suggests applicable procedures if found ← **NEW**
+7. Sets proactive label behavior: `important`, `fact-candidate`, `procedure-candidate` ← **ENHANCED**
 
-**Why allow-all**: In safe mode, every MCP tool call would require manual user approval. For a session start automation this is unsustainable.
+**Why allow-all**: In safe mode, every MCP tool call would require manual user approval.
 
 ### 5.2 SessionEnd — "Memory: Save Session Handoff"
 
@@ -487,7 +490,60 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 5. Calls `summarize_scope()` for final snapshot
 6. Presents compact handoff to the user
 
-### 5.3 SchedulerTick — "Memory: Daily Maintenance"
+### 5.3 PreCompact — "Memory: PreCompact Emergency Save"
+
+**Event**: Context about to be compacted
+**Permission**: `allow-all`
+**Why**: Prevents loss of unrecoverable context. Saves decisions, facts, and a snapshot before compaction.
+
+**Steps**:
+1. Calls `get_recent_memory(limit=5)` to check what is already saved
+2. Saves decisions → `remember(category='decision', importance=9)`
+3. Saves facts → `upsert_fact()`
+4. Saves open loops → `add_open_loop()`
+5. Creates snapshot → `remember(category='note', importance=7)`
+
+### 5.4 SessionStatusChange — "Memory: Session Done - Quality & Archive"
+
+**Event**: Session status changed to `done`
+**Matcher**: `^done$`
+**Permission**: `allow-all`
+
+**Steps**:
+1. Quality assessment → `rate_session()` if score >= 0.7
+2. Knowledge consolidation → `upsert_fact()`, `save_procedure()`
+3. Loop cleanup → `close_open_loop()` for resolved loops
+4. Handoff → `generate_handoff()`
+
+### 5.5 PermissionModeChange — "Memory: Permission Escalation Audit"
+
+**Event**: Permission mode changes from `safe` to `allow-all`
+**Condition**: `state.permissionMode from=safe to=allow-all`
+
+**Steps**:
+1. `remember(category='change', importance=8, tags=['security', 'audit'])`
+2. Warns user about auto-approval risks
+
+### 5.6 FlagChange — "Memory: Flagged Session → Open Loop"
+
+**Event**: Session flagged
+**Matcher**: `true`
+
+**Steps**:
+1. `add_open_loop(title='Flagged Session: ...', priority='high')`
+2. `remember(category='note', importance=8, tags=['flagged'])`
+
+### 5.7 SubagentStart — "Memory: Track Subagent Start"
+
+**Event**: Subagent spawned
+**Steps**: `remember(category='note', importance=5, tags=['subagent', 'spawn'])`
+
+### 5.8 SubagentStop — "Memory: Capture Subagent Outcome"
+
+**Event**: Subagent completed
+**Steps**: If successful → `remember(category='feature', importance=7)`. If failed → `add_open_loop(priority='medium')`
+
+### 5.9 SchedulerTick — "Memory: Daily Maintenance"
 
 **Event**: Cron `0 3 * * *` (every night at 03:00, timezone Europe/Rome)
 **Permission**: `allow-all`
@@ -501,17 +557,55 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 5. Checks stale loops (>30 days)
 6. Presents maintenance report
 
-### 5.4 LabelAdd — "Memory: Promote Important/Fact-Candidate Labels"
+### 5.10 SchedulerTick — "Memory: Weekly Review Report"
 
-**Event**: Label `important` or `fact-candidate` added
-**Matcher**: `^(important|fact-candidate)$`
+**Event**: Cron `0 10 * * 1` (Monday 10:00, timezone Europe/Rome)
+**Labels**: `scheduled`, `weekly-review`
+
+**Steps**:
+1. `memory_stats()` overview
+2. `memory_diff()` analyze week changes
+3. `list_procedures()` + `get_procedure_outcomes()` health check
+4. `get_high_quality_sessions()` quality report
+5. Recommendations: deprecate, promote, close
+
+### 5.11 SchedulerTick — "Memory: Monthly Archive"
+
+**Event**: Cron `0 3 1 * *` (1st of month 03:00, timezone Europe/Rome)
+**Labels**: `scheduled`, `monthly-archive`
+
+**Steps**:
+1. `summarize_scope()` → save as milestone
+2. `export_session_traces()` training data
+3. `run_maintenance()` aggressive cleanup + VACUUM
+4. Archive report with stats
+
+### 5.12 LabelAdd — "Memory: Promote Important/Fact-Candidate/Procedure-Candidate Labels"
+
+**Event**: Label `important`, `fact-candidate`, or `procedure-candidate` added
+**Matcher**: `^(important|fact-candidate|procedure-candidate)$`
 **Permission**: `allow-all`
 
-**Variable**: `$CRAFT_LABEL` contains the name of the added label (documented in Craft Agents automations)
+**Variable**: `$CRAFT_LABEL` contains the name of the added label
 
 **Behavior**:
 - Label `important` → `remember(importance=9)` for key takeaways
 - Label `fact-candidate` → `upsert_fact()` for stable knowledge
+- Label `procedure-candidate` → `save_procedure()` for repeatable workflows ← **NEW**
+
+### 5.13 LabelAdd — "Memory: Suggest Graph Links"
+
+**Event**: Label `link-suggestions` added
+**Matcher**: `^link-suggestions$`
+
+**Steps**: `find_similar()` for recent memories, suggest `link_memories()` pairs
+
+### 5.14 LabelAdd — "Memory: Consolidate Related Memories"
+
+**Event**: Label `consolidate` added
+**Matcher**: `^consolidate$`
+
+**Steps**: `consolidation_candidates()` → propose clusters → `consolidate_memories(confirm=True)` after user approval
 
 ---
 
