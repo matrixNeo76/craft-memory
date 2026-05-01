@@ -1762,6 +1762,12 @@ def run_server():
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["*"],
         )
+        from pathlib import Path
+        from starlette.staticfiles import StaticFiles
+        _ui_dir = Path(__file__).parent.parent.parent / "Craft-Memory-UI"
+        if _ui_dir.exists():
+            app.mount("/ui", StaticFiles(directory=str(_ui_dir), html=True), name="ui")
+            print(f"[craft-memory] UI:       http://{MCP_HOST}:{MCP_PORT}/ui/", flush=True)
         uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
     else:
         print(f"[craft-memory] v{_VERSION} stdio server (workspace: {WORKSPACE_ID})", flush=True)
