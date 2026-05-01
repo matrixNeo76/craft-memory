@@ -36,13 +36,19 @@ const LoopsScreen = ({ onNavigate }) => {
     });
   };
 
-  // ─── Cycle priority (local only — no API endpoint for priority update) ─
+  // ─── Cycle priority — persist to backend via PATCH ────────────────
   const cycle = (id) => {
     const order = ["critical", "high", "medium", "low"];
     setLoops((prev) => prev.map((l) => {
       if (l.id !== id) return l;
       const i = order.indexOf(l.priority);
-      return { ...l, priority: order[(i + 1) % order.length] };
+      const nextPriority = order[(i + 1) % order.length];
+      // Persist to backend (fire-and-forget with rollback on error)
+      CRAFT_API.updateLoop(id, { priority: nextPriority }).catch((e) => {
+        console.warn("update loop priority failed:", e.message);
+        reload(); // rollback to server state
+      });
+      return { ...l, priority: nextPriority };
     }));
   };
 

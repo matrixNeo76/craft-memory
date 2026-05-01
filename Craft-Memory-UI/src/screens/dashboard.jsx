@@ -1,8 +1,22 @@
 // Dashboard — stats hero + recent memories + god_facts + diff stream
 const DashboardScreen = ({ onNavigate }) => {
-  const { STATS, MEMORIES, FACTS, DIFF_EVENTS, formatRelTime, CATEGORIES } = window.CRAFT;
+  const { STATS, MEMORIES, FACTS, formatRelTime, CATEGORIES } = window.CRAFT;
+  const [diffEvents, setDiffEvents] = React.useState(window.CRAFT.DIFF_EVENTS || []);
   const recent = MEMORIES.slice(0, 5);
   const godFacts = [...FACTS].sort((a, b) => b.godScore - a.godScore).slice(0, 6);
+
+  // Load diff events from backend if not already loaded globally
+  React.useEffect(() => {
+    if (diffEvents.length > 0) return; // already populated by loadData
+    const since = new Date(Date.now() - 4 * 3600000).toISOString(); // 4h ago
+    CRAFT_API.diff(since)
+      .then((r) => {
+        const evts = Array.isArray(r) ? r : (r?.events ?? []);
+        setDiffEvents(evts);
+        window.CRAFT.DIFF_EVENTS = evts; // cache globally
+      })
+      .catch((e) => console.warn("[dashboard] diff load failed:", e.message));
+  }, []);
 
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
 
@@ -70,7 +84,7 @@ const DashboardScreen = ({ onNavigate }) => {
       <div className="dash-h">
         <div>
           <h1>Dashboard</h1>
-          <div className="dash-sub">workspace ws_4f8a3c2b1e · last updated {formatRelTime(STATS.uptime ? Date.now() - 60000 : Date.now())}</div>
+          <div className="dash-sub">workspace {window.__CRAFT_CONFIG?.workspaceId || "ws_???"} · server up {STATS.uptime ? formatRelTime(STATS.uptime) : "just now"}</div>
         </div>
         <div className="row gap-12">
           <button className="btn ghost" onClick={() => onNavigate("diff")}><Icon name="diff" /> Memory diff</button>
@@ -197,7 +211,10 @@ const DashboardScreen = ({ onNavigate }) => {
           </div>
         </div>
         <div className="panel-body flush" style={{ maxHeight: 280, overflowY: "auto" }}>
-          {DIFF_EVENTS.map((e, i) => <DiffRow key={i} e={e} />)}
+          {diffEvents.length > 0
+            ? diffEvents.map((e, i) => <DiffRow key={i} e={e} />)
+            : <div style={{ padding: "24px 16px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink-3)" }}>No diff events in the last 4h</div>
+          }
         </div>
       </div>
     </div>

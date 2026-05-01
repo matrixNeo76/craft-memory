@@ -30,6 +30,18 @@
     return res.json();
   }
 
+  async function patch(path, body = {}) {
+    const url = `${base()}${path}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: ws(), ...body }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
   // ─── Normalizers: server row → UI shape ──────────────────────────────
 
   function normMemory(m) {
@@ -95,5 +107,6 @@
     remember:        (body)          => post("/api/memories", body),
     addLoop:         (body)          => post("/api/loops", body).then(normLoop),
     closeLoop:       (id, resolution) => post(`/api/loops/${id}/close`, { resolution: resolution || "" }),
+    updateLoop:      (id, fields)    => patch(`/api/loops/${id}`, fields),
   };
 })();

@@ -1,12 +1,45 @@
 // Session Handoff — generated structured handoff for the current session
 const HandoffScreen = ({ onNavigate }) => {
   const { SESSIONS, MEMORIES, FACTS, LOOPS, formatRelTime } = window.CRAFT;
-  const [selectedSession, setSelectedSession] = React.useState(SESSIONS[0].id);
-  const sess = SESSIONS.find(s => s.id === selectedSession);
+  const [handoffData, setHandoffData] = React.useState(null);
+  const [loadingHandoff, setLoadingHandoff] = React.useState(true);
 
-  const decisions = MEMORIES.filter(m => m.category === "decision").slice(0, 3);
-  const discoveries = MEMORIES.filter(m => m.category === "discovery").slice(0, 2);
-  const openLoops = LOOPS.slice(0, 4);
+  // Attempt to load structured handoff from backend
+  React.useEffect(() => {
+    setLoadingHandoff(true);
+    CRAFT_API.handoff(null)
+      .then((data) => setHandoffData(data))
+      .catch(() => setHandoffData(null))
+      .finally(() => setLoadingHandoff(false));
+  }, []);
+
+  // Safe session: use backend data or fallback to window.CRAFT.SESSIONS[0] with complete defaults
+  const fallbackSession = SESSIONS[0] || {};
+  const [selectedSession, setSelectedSession] = React.useState(fallbackSession.id || "current");
+  const sess = {
+    id:             fallbackSession.id || "current",
+    date:           fallbackSession.date || new Date().toISOString().split("T")[0],
+    duration:       fallbackSession.duration || "—",
+    model:          fallbackSession.model || "—",
+    memoriesAdded:  fallbackSession.memoriesAdded ?? "—",
+    factsLearned:   fallbackSession.factsLearned  ?? "—",
+    loopsOpened:    fallbackSession.loopsOpened   ?? "—",
+    loopsClosed:    fallbackSession.loopsClosed   ?? "—",
+  };
+
+  const decisions    = MEMORIES.filter(m => m.category === "decision").slice(0, 3);
+  const discoveries  = MEMORIES.filter(m => m.category === "discovery").slice(0, 2);
+  const openLoops    = LOOPS.slice(0, 4);
+
+  // Derive next steps from handoff API if available
+  const nextSteps = handoffData?.next_steps || [
+    { text: "Check open loops and resolve any critical ones." },
+    { text: "Run run_maintenance() to compact the DB and prune stale edges." },
+  ];
+
+  // Summary from API or static placeholder
+  const summary = handoffData?.summary ||
+    "No handoff summary available. Call generate_handoff() from the MCP client to produce one.";
 
   return (
     <div className="hand">
@@ -93,10 +126,9 @@ const HandoffScreen = ({ onNavigate }) => {
 
         <h2>Summary</h2>
         <p style={{ color: "var(--ink-1)", margin: 0 }}>
-          Migrated MCP transport from stdio to HTTP after diagnosing repeated Windows-side disconnects. Tuned RRF search parameters
-          (k=60), validated <span className="mono" style={{ color: "var(--accent)" }}>+6–8%</span> accuracy uplift over linear weighting on the eval set, and patched a session-FK
-          violation that surfaced as a duplicate-detection false positive. Documented the BM25 score range observed in this corpus
-          and locked the auto-link threshold at <span className="mono">-2.5</span>.
+          {loadingHandoff ? (
+            <span style={{ color: "var(--ink-3)", fontFamily: "var(--font-mono)", fontSize: 12 }}>Loading handoff…</span>
+          ) : summary}
         </p>
 
         <h2>Decisions</h2>
@@ -142,10 +174,9 @@ const HandoffScreen = ({ onNavigate }) => {
         <h2>Next steps</h2>
         <div className="next-box">
           <ol>
-            <li>Resume on <strong>loop #94</strong> — revise <span className="mono" style={{ color: "var(--accent)" }}>classify_event</span> heuristic for long mixed content.</li>
-            <li>Verify WAL checkpoint behavior under load (loop #89) — set <span className="mono">wal_autocheckpoint=1000</span> and benchmark.</li>
-            <li>Update ARCHITECTURE.md §10.3 with hyperedge role/weight semantics from this session.</li>
-            <li>Run <span className="mono" style={{ color: "var(--accent)" }}>run_maintenance()</span> at next session boundary — last full pass: 14d ago.</li>
+            {nextSteps.map((s, i) => (
+              <li key={i} dangerouslySetInnerHTML={{ __html: s.text || s }} />
+            ))}
           </ol>
         </div>
 

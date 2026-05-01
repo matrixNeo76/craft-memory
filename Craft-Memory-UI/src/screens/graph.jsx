@@ -1,10 +1,26 @@
 // Knowledge Graph viewer — force-directed layout, interactive
 const GraphScreen = ({ onNavigate, focusId }) => {
-  const { MEMORIES, RELATIONS, CATEGORIES } = window.CRAFT;
-  const [selected, setSelected] = React.useState(focusId || 1247);
+  const { MEMORIES, CATEGORIES } = window.CRAFT;
+  const [relations, setRelations] = React.useState(window.CRAFT.RELATIONS || []);
+  const [loadingRel, setLoadingRel] = React.useState(relations.length === 0);
+  const [selected, setSelected] = React.useState(focusId || null);
   const [hovered, setHovered] = React.useState(null);
   const [activeRoles, setActiveRoles] = React.useState(new Set(["core", "context", "detail", "temporal", "causal"]));
 
+  // Load relations from backend if not already loaded globally
+  React.useEffect(() => {
+    if (relations.length > 0) { setLoadingRel(false); return; }
+    CRAFT_API.relations(null, null)
+      .then((r) => {
+        const edges = Array.isArray(r) ? r : (r?.edges ?? []);
+        setRelations(edges);
+        window.CRAFT.RELATIONS = edges; // cache globally
+      })
+      .catch((e) => console.warn("[graph] relations load failed:", e.message))
+      .finally(() => setLoadingRel(false));
+  }, []);
+
+  const RELATIONS = relations;
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
 
   // Simple deterministic layout — circular by category

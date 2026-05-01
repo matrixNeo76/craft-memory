@@ -78,12 +78,17 @@ const App = () => {
         setWsId(health.workspace);
       }
 
-      const [stats, memories, facts, loops] = await Promise.all([
+      const [stats, memories, facts, loops, relations, diff] = await Promise.all([
         CRAFT_API.stats(),
         CRAFT_API.recentMemories(null, 50),
         CRAFT_API.facts(20),
         CRAFT_API.loops(null, "open"),
+        CRAFT_API.relations(null, null).catch(() => []),
+        CRAFT_API.diff(null).catch(() => []),
       ]);
+
+      // Calculate uptime from server boot_time if available
+      const bootTs = health.boot_time ? new Date(health.boot_time).getTime() : null;
 
       window.CRAFT = {
         ...window.CRAFT,
@@ -97,12 +102,23 @@ const App = () => {
           edgesTotal:      stats.total_edges       ?? 0,
           workspaceSize:   stats.db_size_mb != null ? `${stats.db_size_mb} MB` : "—",
           oldestMemory:    "—",
-          uptime:          "—",
+          uptime:          bootTs,
         },
-        MEMORIES: memories,
-        FACTS:    facts,
-        LOOPS:    loops,
-        SESSIONS: [{ id: health.workspace || window.__CRAFT_CONFIG.workspaceId, date: new Date().toISOString().split("T")[0] }],
+        MEMORIES:    memories,
+        FACTS:       facts,
+        LOOPS:       loops,
+        RELATIONS:   Array.isArray(relations) ? relations : (relations?.edges ?? []),
+        DIFF_EVENTS: Array.isArray(diff) ? diff : (diff?.events ?? []),
+        SESSIONS:    [{
+          id:             health.workspace || window.__CRAFT_CONFIG.workspaceId,
+          date:           new Date().toISOString().split("T")[0],
+          duration:       bootTs ? Math.round((Date.now() - bootTs) / 60000) + "m" : "—",
+          model:          health.model || "—",
+          memoriesAdded:  stats.total_memories    ?? 0,
+          factsLearned:   stats.total_facts       ?? 0,
+          loopsOpened:    stats.open_loops        ?? 0,
+          loopsClosed:    0,
+        }],
       };
 
       setLiveStats(stats);
@@ -112,8 +128,8 @@ const App = () => {
       console.warn("[craft-memory] offline:", err.message);
       window.CRAFT = {
         ...window.CRAFT,
-        MEMORIES: [], FACTS: [], LOOPS: [], SESSIONS: [],
-        STATS: { memoriesTotal: 0, memoriesCore: 0, factsTotal: 0, loopsOpen: 0, loopsCritical: 0, proceduresTotal: 0, edgesTotal: 0, workspaceSize: "—", oldestMemory: "—", uptime: "—" },
+        MEMORIES: [], FACTS: [], LOOPS: [], SESSIONS: [], RELATIONS: [], DIFF_EVENTS: [],
+        STATS: { memoriesTotal: 0, memoriesCore: 0, factsTotal: 0, loopsOpen: 0, loopsCritical: 0, proceduresTotal: 0, edgesTotal: 0, workspaceSize: "—", oldestMemory: "—", uptime: null },
       };
       setConnected(false);
       setLoadError(true);
@@ -240,7 +256,13 @@ const App = () => {
         <div>
           <div className="nav-group-label">MCP Tools</div>
           {TOOLS.map(t => (
-            <div key={t.id} className="nav-item" onClick={() => navigate(t.id === "search" ? "explorer" : t.id === "find_similar" ? "graph" : "explorer")}>
+            <div key={t.id} className="nav-item" onClick={() => {
+              if (t.id === "search")       { navigate("explorer", { action: "search" }); }
+              else if (t.id === "find_similar") { navigate("graph",    { action: "find_similar" }); }
+              else if (t.id === "remember")    { navigate("explorer", { action: "remember" }); }
+              else if (t.id === "maintenance") { navigate("dashboard", { action: "maintenance" }); }
+              else { navigate("explorer", { action: t.id }); }
+            }}>
               <Icon name={t.icon} className="icon" />
               <span className="mono" style={{ fontSize: 12 }}>{t.label}</span>
             </div>
