@@ -1592,15 +1592,176 @@ def export_session_traces(min_score: float = 0.0, limit: int = 50) -> str:
     return output
 
 
+# ─── REST API layer for Craft Memory UI (browser-friendly endpoints) ──
+
+@mcp.custom_route("/api/stats", methods=["GET"])
+async def api_stats(request):
+    """Workspace stats summary for UI dashboard."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    conn = _get_conn()
+    stats = _db_get_memory_stats(conn, ws)
+    return JSONResponse(stats)
+
+
+@mcp.custom_route("/api/memories/recent", methods=["GET"])
+async def api_recent_memories(request):
+    """Recent memories ranked by importance × time-decay."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    scope = request.query_params.get("scope") or None
+    limit = min(int(request.query_params.get("limit", "20")), 100)
+    conn = _get_conn()
+    results = _db_get_recent_memory(conn, ws, scope, limit)
+    return JSONResponse(results or [])
+
+
+@mcp.custom_route("/api/memories/search", methods=["GET"])
+async def api_search_memories(request):
+    """Hybrid BM25+Jaccard RRF search. Falls back to recent when no query."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    query = request.query_params.get("q", "").strip()
+    scope = request.query_params.get("scope") or None
+    limit = min(int(request.query_params.get("limit", "20")), 100)
+    conn = _get_conn()
+    if query:
+        results = _db_hybrid_search(conn, query, ws, scope=scope, limit=limit)
+    else:
+        results = _db_get_recent_memory(conn, ws, scope, limit)
+    return JSONResponse(results or [])
+
+
+@mcp.custom_route("/api/facts", methods=["GET"])
+async def api_facts(request):
+    """God facts ranked by confidence × type_bonus × mentions."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    top_n = min(int(request.query_params.get("top_n", "15")), 50)
+    conn = _get_conn()
+    results = _db_god_facts(conn, ws, top_n)
+    return JSONResponse(results or [])
+
+
+@mcp.custom_route("/api/loops", methods=["GET"])
+async def api_loops_get(request):
+    """List open loops filtered by scope and status."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    scope = request.query_params.get("scope") or None
+    status = request.query_params.get("status", "open")
+    conn = _get_conn()
+    results = _db_list_open_loops(conn, ws, scope, status=status)
+    return JSONResponse(results or [])
+
+
+@mcp.custom_route("/api/loops", methods=["POST"])
+async def api_loops_post(request):
+    """Create a new open loop from the UI."""
+    from starlette.responses import JSONResponse
+    body = await request.json()
+    ws = body.get("workspace_id", WORKSPACE_ID)
+    title = (body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "title required"}, status_code=400)
+    description = body.get("description") or None
+    priority = body.get("priority", "medium")
+    scope = body.get("scope", "workspace")
+    conn = _get_conn()
+    loop_id = _db_create_open_loop(conn, CRAFT_SESSION_ID, ws, title, description, priority, scope, CRAFT_SESSION_ID)
+    _maybe_checkpoint(conn)
+    return JSONResponse({"id": loop_id, "title": title, "priority": priority, "scope": scope, "description": description or ""})
+
+
+@mcp.custom_route("/api/diff", methods=["GET"])
+async def api_diff(request):
+    """Memory diff since a given epoch. Defaults to last 24h."""
+    import time
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    since_default = int(time.time()) - 86400
+    since = int(request.query_params.get("since", str(since_default)))
+    conn = _get_conn()
+    result = _db_memory_diff(conn, ws, since)
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/api/relations", methods=["GET"])
+async def api_relations(request):
+    """Get graph relations for a memory node."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    memory_id_str = request.query_params.get("memory_id", "0")
+    direction = request.query_params.get("direction", "both")
+    if not memory_id_str or not memory_id_str.isdigit():
+        return JSONResponse([])
+    conn = _get_conn()
+    results = _db_get_relations(conn, int(memory_id_str), ws, direction)
+    return JSONResponse(results or [])
+
+
+@mcp.custom_route("/api/memories", methods=["POST"])
+async def api_remember(request):
+    """Store a new memory from the UI."""
+    from starlette.responses import JSONResponse
+    body = await request.json()
+    ws = body.get("workspace_id", WORKSPACE_ID)
+    content = _strip_private(body.get("content", ""))
+    if not content:
+        return JSONResponse({"error": "empty content"}, status_code=400)
+    category = body.get("category", "note")
+    importance = int(body.get("importance", 5))
+    scope = body.get("scope", "workspace")
+    tags = body.get("tags") or None
+    conn = _get_conn()
+    mem_id = _db_remember(conn, CRAFT_SESSION_ID, ws, content, category, importance, scope, CRAFT_SESSION_ID, tags)
+    _maybe_checkpoint(conn)
+    if mem_id is None:
+        return JSONResponse({"duplicate": True, "id": None})
+    return JSONResponse({"id": mem_id, "category": category, "importance": importance, "duplicate": False})
+
+
+@mcp.custom_route("/api/loops/{loop_id}/close", methods=["POST"])
+async def api_close_loop(request):
+    """Close an open loop with optional resolution note."""
+    from starlette.responses import JSONResponse
+    loop_id = int(request.path_params["loop_id"])
+    body = await request.json()
+    resolution = body.get("resolution") or None
+    conn = _get_conn()
+    ok = _db_close_open_loop(conn, loop_id, resolution)
+    _maybe_checkpoint(conn)
+    return JSONResponse({"closed": ok, "id": loop_id})
+
+
+@mcp.custom_route("/api/handoff", methods=["GET"])
+async def api_handoff(request):
+    """Generate a structured session handoff pack."""
+    from starlette.responses import JSONResponse
+    ws = request.query_params.get("workspace_id", WORKSPACE_ID)
+    scope = request.query_params.get("scope") or None
+    conn = _get_conn()
+    pack = _db_generate_handoff(conn, ws, scope=scope)
+    return JSONResponse(pack)
+
+
 def run_server():
     """Start the MCP server with the configured transport."""
     if MCP_TRANSPORT == "http":
         import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
         print(f"[craft-memory] v{_VERSION} HTTP server on http://{MCP_HOST}:{MCP_PORT}/mcp", flush=True)
-        print(f"[craft-memory] Health: http://{MCP_HOST}:{MCP_PORT}/health", flush=True)
-        print(f"[craft-memory] Metrics: http://{MCP_HOST}:{MCP_PORT}/metrics", flush=True)
+        print(f"[craft-memory] Health:   http://{MCP_HOST}:{MCP_PORT}/health", flush=True)
+        print(f"[craft-memory] Metrics:  http://{MCP_HOST}:{MCP_PORT}/metrics", flush=True)
+        print(f"[craft-memory] UI API:   http://{MCP_HOST}:{MCP_PORT}/api/*", flush=True)
         print(f"[craft-memory] Workspace: {WORKSPACE_ID}", flush=True)
         app = mcp.streamable_http_app()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["*"],
+        )
         uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
     else:
         print(f"[craft-memory] v{_VERSION} stdio server (workspace: {WORKSPACE_ID})", flush=True)

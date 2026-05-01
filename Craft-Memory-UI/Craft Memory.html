@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Craft Memory — Persistent neural memory for AI agents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" />
+<style>
+  :root {
+    --bg-0: #05070d;
+    --bg-1: #0a0f1a;
+    --bg-2: #0f1623;
+    --bg-3: #141d2e;
+    --line: rgba(120, 170, 255, 0.10);
+    --line-2: rgba(120, 170, 255, 0.18);
+    --ink-0: #e8f0ff;
+    --ink-1: #b6c4dc;
+    --ink-2: #7d8aa3;
+    --ink-3: #4d586e;
+    --accent-h: 220;
+    --accent: oklch(0.78 0.18 var(--accent-h));
+    --accent-2: oklch(0.85 0.14 calc(var(--accent-h) + 30));
+    --accent-soft: oklch(0.78 0.18 var(--accent-h) / 0.14);
+    --accent-glow: oklch(0.78 0.18 var(--accent-h) / 0.55);
+    --critical: oklch(0.72 0.20 22);
+    --high: oklch(0.78 0.16 55);
+    --medium: oklch(0.82 0.14 95);
+    --low: oklch(0.78 0.12 150);
+    --radius: 10px;
+    --radius-sm: 6px;
+    --pad: 16px;
+    --pad-sm: 10px;
+    --row: 36px;
+    --font-ui: "Geist", -apple-system, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --glow: 0 0 0 1px var(--line-2), 0 0 24px -8px var(--accent-glow);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg-0);
+    color: var(--ink-0);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    height: 100vh;
+  }
+
+  /* Background grid + faint circuits */
+  .bg-canvas {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(ellipse 90% 60% at 20% 0%, oklch(0.78 0.18 var(--accent-h) / 0.08), transparent 60%),
+      radial-gradient(ellipse 60% 50% at 100% 100%, oklch(0.85 0.14 calc(var(--accent-h) + 30) / 0.06), transparent 60%),
+      var(--bg-0);
+  }
+  .bg-grid {
+    position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    background-image:
+      linear-gradient(to right, var(--line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--line) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 50%, black 30%, transparent 90%);
+    opacity: 0.6;
+  }
+  .bg-binary {
+    position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    overflow: hidden;
+    opacity: 0.06;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    line-height: 1.3;
+    user-select: none;
+  }
+  .bg-binary-col {
+    position: absolute; top: -10%;
+    writing-mode: vertical-rl;
+    white-space: nowrap;
+    animation: rain linear infinite;
+  }
+  @keyframes rain {
+    from { transform: translateY(-50%); }
+    to { transform: translateY(50%); }
+  }
+
+  #root { position: relative; z-index: 10; height: 100vh; }
+
+  /* App shell */
+  .shell {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: 56px 1fr 28px;
+    height: 100vh;
+  }
+  .shell.dense { grid-template-columns: 220px 1fr; }
+  .topbar {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(to bottom, var(--bg-1), var(--bg-0));
+    position: relative;
+  }
+  .topbar::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+    background: linear-gradient(to right, transparent, var(--accent-glow), transparent);
+    opacity: 0.4;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 200px; }
+  .brand-mark { width: 28px; height: 28px; }
+  .brand-name { font-weight: 600; font-size: 14px; letter-spacing: 0.2px; }
+  .brand-sub { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); margin-left: 6px; }
+
+  .topbar-search {
+    flex: 1; max-width: 520px;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-1);
+  }
+  .topbar-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .topbar-search input {
+    flex: 1; background: transparent; border: 0; outline: 0;
+    font: inherit; color: var(--ink-0);
+  }
+  .topbar-search kbd {
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--ink-2); background: var(--bg-3);
+    padding: 2px 5px; border-radius: 3px; border: 1px solid var(--line);
+  }
+  .topbar-meta { display: flex; align-items: center; gap: 14px; font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
+  .topbar-status { display: flex; align-items: center; gap: 6px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: oklch(0.78 0.18 150); box-shadow: 0 0 8px oklch(0.78 0.18 150); }
+  .dot.warn { background: var(--medium); box-shadow: 0 0 8px var(--medium); }
+
+  /* Sidebar */
+  .sidebar {
+    border-right: 1px solid var(--line);
+    background: var(--bg-1);
+    padding: 16px 12px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .nav-group-label {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--ink-3);
+    padding: 0 10px; margin-bottom: 6px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px; border-radius: var(--radius-sm);
+    color: var(--ink-1); font-size: 13px;
+    cursor: pointer; user-select: none;
+    border: 1px solid transparent;
+    position: relative;
+  }
+  .nav-item:hover { background: var(--bg-2); color: var(--ink-0); }
+  .nav-item.active {
+    background: var(--accent-soft);
+    color: var(--ink-0);
+    border-color: var(--line-2);
+  }
+  .nav-item.active::before {
+    content: ""; position: absolute; left: -12px; top: 8px; bottom: 8px; width: 2px;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+  }
+  .nav-item .icon { width: 14px; height: 14px; color: var(--ink-2); flex: none; }
+  .nav-item.active .icon { color: var(--accent); }
+  .nav-item .badge {
+    margin-left: auto;
+    font-family: var(--font-mono); font-size: 10px;
+    background: var(--bg-3); color: var(--ink-2);
+    padding: 1px 6px; border-radius: 999px;
+  }
+  .nav-item.active .badge { background: var(--accent); color: var(--bg-0); }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding: 12px 10px;
+    border-top: 1px solid var(--line);
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--ink-3);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .sidebar-footer .row { display: flex; justify-content: space-between; }
+  .sidebar-footer .row span:last-child { color: var(--ink-1); }
+
+  /* Main area */
+  .main { overflow-y: auto; position: relative; }
+  .main-inner { padding: 24px 32px 48px; max-width: 1400px; }
+  .shell.dense .main-inner { padding: 16px 22px 32px; }
+
+  /* Status bar */
+  .statusbar {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 20px;
+    border-top: 1px solid var(--line);
+    background: var(--bg-1);
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--ink-3);
+  }
+  .statusbar .sep { width: 1px; height: 12px; background: var(--line); }
+  .statusbar .ok { color: oklch(0.78 0.18 150); }
+  .statusbar .accent { color: var(--accent); }
+
+  /* Generic UI primitives */
+  .panel {
+    background: var(--bg-1);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .panel-title {
+    font-size: 12px; font-weight: 500;
+    font-family: var(--font-mono); letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-1);
+  }
+  .panel-title .dim { color: var(--ink-3); }
+  .panel-body { padding: 16px; }
+  .panel-body.flush { padding: 0; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    color: var(--ink-1);
+    font: inherit; font-size: 12px;
+    cursor: pointer;
+  }
+  .btn:hover { color: var(--ink-0); border-color: var(--line-2); background: var(--bg-3); }
+  .btn.primary {
+    background: var(--accent);
+    color: var(--bg-0);
+    border-color: var(--accent);
+    font-weight: 500;
+  }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.ghost { background: transparent; }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 8px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--ink-1);
+    letter-spacing: 0.02em;
+  }
+  .chip.accent { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-soft); }
+  .chip.solid { background: var(--accent); color: var(--bg-0); border-color: var(--accent); }
+  .chip.muted { color: var(--ink-3); }
+  .chip-dot { width: 5px; height: 5px; border-radius: 50%; }
+
+  .mono { font-family: var(--font-mono); }
+  .dim { color: var(--ink-2); }
+  .dimmer { color: var(--ink-3); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--bg-0); }
+  ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg-0); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--line-2); }
+
+  /* Selection */
+  ::selection { background: var(--accent-soft); color: var(--ink-0); }
+
+  /* Glow border */
+  .glow-border {
+    position: relative;
+  }
+  .glow-border::after {
+    content: ""; position: absolute; inset: -1px; border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(135deg, transparent, var(--accent-glow), transparent);
+    opacity: 0.25;
+    -webkit-mask: linear-gradient(#000, #000) content-box, linear-gradient(#000, #000);
+    -webkit-mask-composite: xor; mask-composite: exclude;
+    padding: 1px;
+  }
+
+  /* utility */
+  .row { display: flex; align-items: center; gap: 8px; }
+  .col { display: flex; flex-direction: column; }
+  .gap-12 { gap: 12px; }
+  .gap-16 { gap: 16px; }
+  .gap-24 { gap: 24px; }
+  .grow { flex: 1; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+
+  /* Density modifier */
+  .shell.dense .panel-body { padding: 12px; }
+  .shell.dense .panel-head { padding: 8px 12px; }
+  .shell.dense .nav-item { padding: 5px 8px; font-size: 12px; }
+
+  /* Glow off mode handled via JS */
+  body.glow-off { --glow: 0 0 0 1px var(--line-2); }
+  body.glow-off .nav-item.active::before { box-shadow: none; }
+  body.glow-off .dot { box-shadow: none; }
+
+  body.motion-off * { animation: none !important; transition: none !important; }
+  body.grid-off .bg-grid { display: none; }
+  body.grid-off .bg-binary { display: none; }
+</style>
+
+<!-- React + Babel -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div class="bg-canvas"></div>
+  <div class="bg-grid"></div>
+  <div class="bg-binary" id="bg-binary"></div>
+  <div id="root"></div>
+
+  <!-- Tweaks defaults (host-edited via __edit_mode_set_keys) -->
+  <script>
+  window.__CRAFT_TWEAKS__ = /*EDITMODE-BEGIN*/{
+    "accentHue": 220,
+    "density": "comfortable",
+    "background": "slate",
+    "showGrid": true,
+    "showBinary": true,
+    "monoFont": "JetBrains Mono",
+    "uiFont": "Inter",
+    "glow": "subtle",
+    "motion": "lively",
+    "circuitLines": true,
+    "scanlines": false
+  }/*EDITMODE-END*/;
+  </script>
+
+  <!-- Components -->
+  <script type="text/babel" src="src/icons.jsx"></script>
+  <script type="text/babel" src="src/data.jsx"></script>
+  <script type="text/babel" src="src/config.jsx"></script>
+  <script type="text/babel" src="src/api.jsx"></script>
+  <script type="text/babel" src="src/logo.jsx"></script>
+  <script type="text/babel" src="src/screens/home.jsx"></script>
+  <script type="text/babel" src="src/screens/dashboard.jsx"></script>
+  <script type="text/babel" src="src/screens/explorer.jsx"></script>
+  <script type="text/babel" src="src/screens/graph.jsx"></script>
+  <script type="text/babel" src="src/screens/loops.jsx"></script>
+  <script type="text/babel" src="src/screens/handoff.jsx"></script>
+  <script type="text/babel" src="src/screens/diff.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="src/app.jsx"></script>
+
+  <!-- Binary rain background -->
+  <script>
+    (function() {
+      const host = document.getElementById('bg-binary');
+      if (!host) return;
+      const cols = 18;
+      for (let i = 0; i < cols; i++) {
+        const c = document.createElement('div');
+        c.className = 'bg-binary-col';
+        c.style.left = (i * (100 / cols)) + '%';
+        c.style.animationDuration = (18 + Math.random() * 22) + 's';
+        c.style.animationDelay = (-Math.random() * 20) + 's';
+        let s = '';
+        for (let j = 0; j < 80; j++) s += (Math.random() > 0.5 ? '1' : '0') + ' ';
+        c.textContent = s;
+        host.appendChild(c);
+      }
+    })();
+  </script>
+</body>
+</html>
