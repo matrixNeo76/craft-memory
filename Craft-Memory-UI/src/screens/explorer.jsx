@@ -9,7 +9,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
   const [sortBy, setSortBy]         = React.useState("rrf");
 
   // ─── Server-side search state ──────────────────────────────────────
-  const [searchResults, setSearchResults] = React.useState(null); // null = use local
+  const [searchResults, setSearchResults] = React.useState(null);
   const [searching, setSearching]         = React.useState(false);
   const [searchError, setSearchError]     = React.useState(null);
 
@@ -17,14 +17,27 @@ const ExplorerScreen = ({ onNavigate, action }) => {
   const [relations, setRelations] = React.useState(window.CRAFT.RELATIONS || []);
   const [loadingRel, setLoadingRel] = React.useState(!window.CRAFT.RELATIONS_LOADED);
 
-  // ─── Pagination + expandable neighbors ──────────────────────────────
-  const [showCount, setShowCount]   = React.useState(50);
+  // ─── Pagination + expandable neighbors + content truncation ─────────
+  const [showCount, setShowCount]     = React.useState(50);
   const [expandedCards, setExpandedCards] = React.useState(new Set());
+  const [showFullContent, setShowFullContent] = React.useState(new Set());
 
   // ─── "Remember" modal state ─────────────────────────────────────────
   const [showRemember, setShowRemember] = React.useState(false);
 
   const inputRef = React.useRef(null);
+
+  // ─── ⌘K keyboard shortcut to focus search ──────────────────────────
+  React.useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   // ─── Load relations if not already cached by Graph screen ───────────
   React.useEffect(() => {
@@ -40,17 +53,40 @@ const ExplorerScreen = ({ onNavigate, action }) => {
       .finally(() => setLoadingRel(false));
   }, []);
 
-  // ─── Helpers for graph data ─────────────────────────────────────────
-  function edgeCount(memId) {
-    return relations.filter(r => r.source === memId || r.target === memId).length;
-  }
-  function neighborEdges(memId) {
-    return relations.filter(r => r.source === memId || r.target === memId);
-  }
+  // ─── Precomputed edge data: O(1) lookups instead of O(N) filters ────
+  const edgeCounts = React.useMemo(() => {
+    const counts = {};
+    for (const r of relations) {
+      counts[r.source] = (counts[r.source] || 0) + 1;
+      counts[r.target] = (counts[r.target] || 0) + 1;
+    }
+    return counts;
+  }, [relations]);
+
+  const neighborsMap = React.useMemo(() => {
+    const map = {};
+    for (const r of relations) {
+      if (!map[r.source]) map[r.source] = [];
+      if (!map[r.target]) map[r.target] = [];
+      map[r.source].push(r);
+      map[r.target].push(r);
+    }
+    return map;
+  }, [relations]);
+
+  function edgeCount(memId) { return edgeCounts[memId] || 0; }
+  function neighborEdges(memId) { return neighborsMap[memId] || []; }
+
   function toggleExpanded(memId) {
     const next = new Set(expandedCards);
     next.has(memId) ? next.delete(memId) : next.add(memId);
     setExpandedCards(next);
+  }
+
+  function toggleFullContent(memId) {
+    const next = new Set(showFullContent);
+    next.has(memId) ? next.delete(memId) : next.add(memId);
+    setShowFullContent(next);
   }
 
   // React to routeArgs.action from sidebar MCP tool clicks
@@ -86,15 +122,21 @@ const ExplorerScreen = ({ onNavigate, action }) => {
     return () => clearTimeout(timer);
   }, [query, activeScope]);
 
-  // ─── Filtered list (server results or local fallback) ───────────────
-  const baseList = query.trim() && searchResults !== null ? searchResults : MEMORIES;
+  // ─── Computed lists (all memoized) ─────────────────────────────────
+  const baseList = React.useMemo(
+    () => query.trim() && searchResults !== null ? searchResults : MEMORIES,
+    [query, searchResults, MEMORIES]
+  );
 
-  // Category counts: dynamic — reflect current search results, not total DB
   const catCounts = React.useMemo(() => {
     const counts = {};
-    for (const m of baseList) {
-      counts[m.category] = (counts[m.category] || 0) + 1;
-    }
+    for (const m of baseList) counts[m.category] = (counts[m.category] || 0) + 1;
+    return counts;
+  }, [baseList]);
+
+  const scopeCounts = React.useMemo(() => {
+    const counts = { all: baseList.length };
+    for (const m of baseList) counts[m.scope] = (counts[m.scope] || 0) + 1;
     return counts;
   }, [baseList]);
 
@@ -113,18 +155,21 @@ const ExplorerScreen = ({ onNavigate, action }) => {
     if (sortBy === "importance") out = [...out].sort((a, b) => b.importance - a.importance);
     else if (sortBy === "recent") out = [...out].sort((a, b) => b.ts - a.ts);
     return out;
-  }, [query, searchResults, activeCats, activeScope, coreOnly, sortBy]);
+  }, [baseList, activeCats, activeScope, coreOnly, sortBy, query, searchResults]);
 
-  // Pagination
-  const displayed = filtered.slice(0, showCount);
+  const displayed = React.useMemo(() => filtered.slice(0, showCount), [filtered, showCount]);
   const hasMore = filtered.length > showCount;
 
-  const highlight = (text, q) => {
-    if (!q.trim()) return text;
-    const re = new RegExp("(" + q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
-    const parts = text.split(re);
-    return parts.map((p, i) => re.test(p) ? <mark key={i}>{p}</mark> : <span key={i}>{p}</span>);
-  };
+  // Memoized highlight — single RegExp, reused across cards
+  const highlight = React.useMemo(() => {
+    if (!query.trim()) return (text) => text;
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("(" + escaped + ")", "gi");
+    return (text) => {
+      const parts = text.split(re);
+      return parts.map((p, i) => re.test(p) ? React.createElement("mark", { key: i }, p) : React.createElement("span", { key: i }, p));
+    };
+  }, [query]);
 
   const toggleCat = (id) => {
     const next = new Set(activeCats);
@@ -134,6 +179,21 @@ const ExplorerScreen = ({ onNavigate, action }) => {
 
   const usingServerSearch = query.trim() && searchResults !== null;
   const totalDb = window.CRAFT.STATS?.memoriesTotal || MEMORIES.length;
+  const MAX_CONTENT_PREVIEW = 280;
+
+  // Early return: loading state before MEMORIES arrive
+  if (MEMORIES.length === 0) {
+    return (
+      <div className="exp">
+        <style>{`.exp { min-height: 400px; }`}</style>
+        <div className="exp-h"><div><h1>Memory Explorer</h1></div></div>
+        <div style={{ gridColumn: "1 / -1", padding: "80px 20px", textAlign: "center", color: "var(--ink-3)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+          <div className="search-spinner" style={{ margin: "0 auto 12px" }} />
+          Loading memories…
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="exp">
@@ -189,6 +249,8 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         .empty-state { padding: 60px 20px; text-align: center; color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; }
         .search-badge { padding: 2px 8px; border-radius: 999px; font-family: var(--font-mono); font-size: 10px; background: var(--accent-soft); color: var(--accent); border: 1px solid oklch(0.78 0.18 var(--accent-h) / 0.3); }
         .search-err { padding: 8px 14px; font-family: var(--font-mono); font-size: 11px; color: var(--critical); border-bottom: 1px solid var(--line); }
+        .expand-link { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); cursor: pointer; display: inline-block; margin-top: 4px; }
+        .expand-link:hover { color: var(--accent); }
         /* ── Graph edge badge / inline neighbors ── */
         .edge-badge { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 10px; color: var(--ink-2); cursor: pointer; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); }
         .edge-badge:hover { background: var(--bg-2); color: var(--accent); }
@@ -231,7 +293,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <h1>Memory Explorer</h1>
           <div className="sub">
             RRF hybrid search · FTS5 BM25 + Jaccard · {totalDb.toLocaleString()} total in DB
-            {" · "}{relations.length.toLocaleString()} graph edges
+            {" · "}{relations.length.toLocaleString()} graph edges · <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "1px 4px", borderRadius: 2, border: "1px solid var(--line)" }}>⌘K</kbd> to search
           </div>
         </div>
         <button className="btn primary" onClick={() => setShowRemember(true)}>
@@ -247,7 +309,9 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           placeholder='"transport" OR scope:project tag:fts5'
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); e.target.blur(); } }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") { setQuery(""); e.target.blur(); }
+          }}
           autoFocus
         />
         <span className="syntax mono">)</span>
@@ -278,16 +342,12 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         <div className="filter-block">
           <div className="filter-h">Scope</div>
           <div className="filter-body">
-            {["all", ...SCOPES].map(s => {
-              const on = activeScope === s;
-              const count = s === "all" ? baseList.length : baseList.filter(m => m.scope === s).length;
-              return (
-                <div key={s} className={"filter-item" + (on ? " on" : "")} onClick={() => setActiveScope(s)}>
-                  <span>{s}</span>
-                  <span className="count">{count}</span>
-                </div>
-              );
-            })}
+            {["all", ...SCOPES].map(s => (
+              <div key={s} className={"filter-item" + (activeScope === s ? " on" : "")} onClick={() => setActiveScope(s)}>
+                <span>{s}</span>
+                <span className="count">{scopeCounts[s] || 0}</span>
+              </div>
+            ))}
           </div>
         </div>
 
@@ -327,6 +387,8 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           {displayed.map((m, i) => {
             const eCount = edgeCount(m.id);
             const expanded = expandedCards.has(m.id);
+            const contentLong = m.content.length > MAX_CONTENT_PREVIEW;
+            const showingFull = showFullContent.has(m.id);
             return (
               <div key={m.id} className="res-card">
                 <div className="res-top">
@@ -336,9 +398,9 @@ const ExplorerScreen = ({ onNavigate, action }) => {
                   {m.isCore && <span className="chip accent"><Icon name="core" size={10} /> core</span>}
                   <span className="chip muted">{m.confidence}</span>
                   {eCount > 0 && (
-                    <span className="edge-badge" onClick={() => toggleExpanded(m.id)}
-                      title={`${eCount} edge${eCount > 1 ? "s" : ""} — click to ${expanded ? "hide" : "show"}`}>
-                      <Icon name="link" size={9} /> {eCount} edge{eCount > 1 ? "s" : ""}
+                    <span className={"edge-badge" + (expanded ? " on" : "")} onClick={() => toggleExpanded(m.id)}
+                      title={`${eCount} edge${eCount > 1 ? "s" : ""}`}>
+                      ◆ {eCount}
                     </span>
                   )}
                   <div className="res-meta">
@@ -353,8 +415,13 @@ const ExplorerScreen = ({ onNavigate, action }) => {
                   </div>
                 </div>
                 <div className="res-content" onClick={() => onNavigate("graph", { focusId: m.id })}>
-                  {highlight(m.content, query)}
+                  {highlight(showingFull ? m.content : m.content.slice(0, MAX_CONTENT_PREVIEW))}
                 </div>
+                {contentLong && (
+                  <span className="expand-link" onClick={(e) => { e.stopPropagation(); toggleFullContent(m.id); }}>
+                    {showingFull ? "▲ show less" : "▼ show all (" + m.content.length + " chars)"}
+                  </span>
+                )}
                 <div className="res-tags">
                   {m.tags.map(t => <span key={t} className="chip muted"><Icon name="tag" size={9} /> {t}</span>)}
                 </div>
