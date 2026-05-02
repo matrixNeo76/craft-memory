@@ -71,6 +71,7 @@ from craft_memory_mcp.db import (
     get_facts as _db_get_facts,
     get_latest_summary as _db_get_latest_summary,
     get_recent_memory as _db_get_recent_memory,
+    get_all_relations as _db_get_all_relations,
     get_relations as _db_get_relations,
     god_facts as _db_god_facts,
     link_memories as _db_link_memories,
@@ -1715,16 +1716,32 @@ async def api_diff(request):
 
 @mcp.custom_route("/api/relations", methods=["GET"])
 async def api_relations(request):
-    """Get graph relations for a memory node."""
+    """Get graph relations — ALL edges for the graph UI, or per-memory details.
+
+    Query params:
+      workspace_id (required): target workspace
+      memory_id    (optional): if set, returns edges only for that memory + direction;
+                               if omitted, returns ALL edges for the workspace
+                               (used by Knowledge Graph UI to render the full graph).
+      direction    (optional): "in" | "out" | "both" (default "both", used only with memory_id)
+
+    Returns objects normalized for the UI: source, target, role, weight, confidence, relation_type.
+    """
     from starlette.responses import JSONResponse
     ws = _resolve_ws(request.query_params.get("workspace_id"))
-    memory_id_str = request.query_params.get("memory_id", "0")
+    memory_id_str = request.query_params.get("memory_id")
     direction = request.query_params.get("direction", "both")
-    if not memory_id_str or not memory_id_str.isdigit():
-        return JSONResponse([])
+
     conn = _get_conn()
-    results = _db_get_relations(conn, int(memory_id_str), ws, direction)
-    return JSONResponse(results or [])
+
+    # If memory_id is specified and valid → return per-memory edges
+    if memory_id_str and memory_id_str.isdigit():
+        results = _db_get_relations(conn, int(memory_id_str), ws, direction)
+        return JSONResponse(results or [])
+
+    # No memory_id → return ALL edges for the workspace (graph UI)
+    all_edges = _db_get_all_relations(conn, ws)
+    return JSONResponse(all_edges or [])
 
 
 @mcp.custom_route("/api/memories", methods=["POST"])

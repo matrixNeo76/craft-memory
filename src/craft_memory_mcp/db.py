@@ -1167,6 +1167,39 @@ def get_relations(
     return [dict(r) for r in rows]
 
 
+def get_all_relations(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """Return ALL relations for a workspace, normalized for graph UI.
+
+    Returns objects with source_id -> source, target_id -> target,
+    plus role, weight, confidence, and relation_type for visualization.
+    Used by the Knowledge Graph UI to render the full graph.
+    """
+    rows = conn.execute(
+        """SELECT mr.id, mr.source_id, mr.target_id, mr.relation AS relation_type,
+                  mr.confidence_type AS confidence, mr.confidence_score,
+                  mr.role, mr.weight, mr.is_manual,
+                  m1.content AS source_content, m2.content AS target_content
+           FROM memory_relations mr
+           JOIN memories m1 ON mr.source_id = m1.id
+           JOIN memories m2 ON mr.target_id = m2.id
+           WHERE mr.workspace_id = ?""",
+        (workspace_id,),
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        # Normalize for UI: source_id -> source, target_id -> target
+        d["source"] = d.pop("source_id")
+        d["target"] = d.pop("target_id")
+        # UI expects r.relation (not r.relation_type) for edge label
+        d["relation"] = d.get("relation_type", "semantically_similar_to")
+        result.append(d)
+    return result
+
+
 def get_relations_by_role(
     conn: sqlite3.Connection,
     memory_id: int,
