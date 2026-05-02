@@ -64,6 +64,12 @@ def start_server(host: str | None = None, port: int | None = None,
     env["CRAFT_MEMORY_TRANSPORT"] = transport
     env["CRAFT_MEMORY_HOST"] = h
     env["CRAFT_MEMORY_PORT"] = str(p)
+    # Propagate CRAFT_WORKSPACE_ID from parent env so the server
+    # starts with the correct workspace database. Fallback: "default".
+    # Belt-and-suspenders: the automation command prefix already sets this,
+    # but this ensures it works regardless of shell syntax (bash vs cmd).
+    if "CRAFT_WORKSPACE_ID" not in env:
+        env["CRAFT_WORKSPACE_ID"] = os.environ.get("CRAFT_WORKSPACE", "default")
 
     cmd = [sys.executable, "-m", "craft_memory_mcp.server"]
 
@@ -542,6 +548,35 @@ def cmd_install(args):
         print(f"  Next: Start a new session and run 'craft-memory check'")
 
 
+# ─── Scan sessions ───────────────────────────────────────────────────
+
+def cmd_scan(args):
+    """Scan unprocessed Craft Agents sessions and save discoveries to memory."""
+    # Locate the scanner script relative to this file
+    scanner_script = os.path.join(
+        os.path.dirname(__file__), "..", "..", "scripts", "session-scanner.py",
+    )
+    scanner_script = os.path.abspath(scanner_script)
+
+    if not os.path.exists(scanner_script):
+        print(f"ERROR: Scanner script not found at {scanner_script}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [sys.executable, scanner_script, args.workspace]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.force:
+        cmd.append("--force")
+    if args.verbose:
+        cmd.append("--verbose")
+    if args.json:
+        cmd.append("--json")
+
+    # Run in same process group
+    result = subprocess.run(cmd, timeout=args.timeout or 120)
+    sys.exit(result.returncode)
+
+
 # ─── Argument parser ─────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -570,6 +605,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ensure = sub.add_parser("ensure", help="Ensure server is running; start if down")
     p_ensure.add_argument("--host", default=None, help="HTTP host override")
     p_ensure.add_argument("--port", type=int, default=None, help="HTTP port override")
+
+    # scan
+    p_scan = sub.add_parser("scan", help="Scan unprocessed sessions and save discoveries to memory")
+    p_scan.add_argument("workspace", nargs="?",
+                        default=os.path.expanduser("~/.craft-agent/workspaces/auresys-backend"),
+                        help="Path to Craft Agents workspace")
+    p_scan.add_argument("--dry-run", action="store_true", help="Simulate without saving")
+    p_scan.add_argument("--force", action="store_true", help="Re-scan already processed sessions")
+    p_scan.add_argument("--verbose", "-v", action="store_true", help="Show per-session details")
+    p_scan.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_scan.add_argument("--timeout", type=int, default=120,
+                        help="Max execution time in seconds (default: 120)")
 
     # install
     p_install = sub.add_parser("install", help="Install into a Craft Agents workspace")
@@ -607,6 +654,7 @@ def main():
         "stop": cmd_stop,
         "ensure": cmd_ensure,
         "install": cmd_install,
+        "scan": cmd_scan,
     }
 
     if args.command in commands:

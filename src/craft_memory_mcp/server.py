@@ -250,14 +250,23 @@ _conn = None
 
 # WAL checkpoint counter — flush WAL every N writes to keep file size bounded
 _write_count = 0
-_CHECKPOINT_EVERY = 100
-
+_CHECKPOINT_EVERY = 50  # Checkpoint every 50 writes (was 100)
 
 def _maybe_checkpoint(conn) -> None:
+    """Checkpoint WAL every N writes. Uses TRUNCATE to keep WAL file size bounded.
+
+    PRAGMA wal_checkpoint(TRUNCATE) moves WAL pages back to the main DB file
+    and truncates the WAL to 0 bytes. This prevents unbounded WAL growth which
+    can reach 3+ MB during heavy graph edge creation (backfill, auto-linking).
+    """
     global _write_count
     _write_count += 1
     if _write_count >= _CHECKPOINT_EVERY:
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            # Fallback to PASSIVE if TRUNCATE fails (shared WAL, etc.)
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         _write_count = 0
 
 
@@ -549,9 +558,16 @@ def summarize_scope(
     conn = _get_conn()
     result = _db_summarize_scope(conn, WORKSPACE_ID, scope)
 
+    total_mem = result.get('total_memory_count', result['memory_count'])
+    shown_mem = result['memory_count']
+    if total_mem == shown_mem:
+        mem_label = str(total_mem)
+    else:
+        mem_label = f"{shown_mem} shown / {total_mem} total"
+
     lines = [
         f"=== Memory Summary: {result['workspace_id']} / {result['scope']} ===\n",
-        f"Stats: {result['memory_count']} memories, {result['fact_count']} facts, "
+        f"Stats: {mem_label} memories, {result['fact_count']} facts, "
         f"{result['open_loop_count']} open loops\n",
     ]
 

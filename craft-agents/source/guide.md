@@ -10,6 +10,8 @@ The MCP server runs in **HTTP** mode on `http://localhost:8392/mcp`.
 - **Start**: `craft-memory ensure`
 - **If the server is down**: tools will fail with connection errors. Run `craft-memory ensure` before using the source.
 
+> **Windows Job Object**: When Craft Agents (Electron) restarts, Windows Job Objects terminate child processes — even `DETACHED_PROCESS` ones. The automations handle this with `"type": "command"` actions that run `craft-memory ensure` deterministically before each `"type": "prompt"` action. This guarantees the server is up without relying on LLM interpretation.
+
 ## Scope
 
 MCP source exposing 7 tools for managing episodic memory, stable facts, and open loops. Data persists in `~/.craft-agent/memory/{workspaceId}.db` and survives model/provider changes.

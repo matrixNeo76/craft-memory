@@ -18,6 +18,7 @@
 8. [Deployment Guide for New Installations](#8-deployment-guide-for-new-installations)
 9. [Reusability Analysis for Craft Agents](#9-reusability-analysis-for-craft-agents)
 10. [Stability-First Design Principles](#10-stability-first-design-principles)
+11. [Session Scanner](#11-session-scanner)
 
 ---
 
@@ -459,21 +460,27 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 
 ## 5. Automations
 
-13 automations configured in `automations.json` (expanded 2026-05-01):
+14 automations configured in `automations.json` (updated 2026-05-02):
 
-### 5.1 SessionStart — "Memory: Recover Session Context (Enhanced)"
+> **Action types**: Craft Agents automations support `prompt` (sends text to LLM — fragile, model-dependent) and `command` (executes shell command directly — deterministic, always runs). The memory automations use **`command` actions for server startup** (`craft-memory ensure`) and **`prompt` actions for agent memory operations**. This ensures the MCP server is running before the agent sees any instructions.
+
+### 5.1 SessionStart — "Memory: Start Server & Recover Context (Enhanced)"
 
 **Event**: Session starts
 **Permission**: `allow-all`
 
+**Action type**: `command` + `prompt`
+
 **Steps**:
-1. Runs `craft-memory ensure` → starts server if down
-2. Calls `get_recent_memory(scope='workspace', limit=10)`
+1. **`command`**: Runs `craft-memory ensure` → starts server if down (deterministic, no agent interpretation)
+2. **`prompt`**: Calls `get_recent_memory(scope='workspace', limit=10)`
 3. Calls `list_open_loops()`
-4. Calls `get_applicable_procedures(current_context='session start', limit=3)` ← **NEW**
+4. Calls `get_applicable_procedures(current_context='session start', limit=3)`
 5. Summarizes context for the user
-6. Suggests applicable procedures if found ← **NEW**
-7. Sets proactive label behavior: `important`, `fact-candidate`, `procedure-candidate` ← **ENHANCED**
+6. Suggests applicable procedures if found
+7. Sets proactive label behavior: `important`, `fact-candidate`, `procedure-candidate`
+
+**Why command action first**: When Craft Agents restarts on Windows, the child process (craft-memory server) is killed by Windows Job Objects. The `command` action runs `craft-memory ensure` directly via shell, without waiting for the LLM to interpret a prompt. If the server was killed, it restarts immediately. See [§7.9](#79-windows-job-object-kills-server-on-craft-agents-restart).
 
 **Why allow-all**: In safe mode, every MCP tool call would require manual user approval.
 
@@ -482,13 +489,16 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 **Event**: Session ends
 **Permission**: `allow-all`
 
+**Action type**: `command` + `prompt`
+
 **Steps**:
-1. Calls `remember(category='decision', importance=8)` for key decisions
-2. Calls `remember(category='discovery', importance=7)` for discoveries
-3. Calls `upsert_fact()` for confirmed stable knowledge
-4. Calls `close_open_loop()` for resolved loops
-5. Calls `summarize_scope()` for final snapshot
-6. Presents compact handoff to the user
+1. **`command`**: Runs `craft-memory ensure` → ensures server is up before saving
+2. **`prompt`**: Calls `remember(category='decision', importance=8)` for key decisions
+3. Calls `remember(category='discovery', importance=7)` for discoveries
+4. Calls `upsert_fact()` for confirmed stable knowledge
+5. Calls `close_open_loop()` for resolved loops
+6. Calls `summarize_scope()` for final snapshot
+7. Presents compact handoff to the user
 
 ### 5.3 PreCompact — "Memory: PreCompact Emergency Save"
 
@@ -549,9 +559,11 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 **Permission**: `allow-all`
 **Labels**: `scheduled`, `memory-maintenance`
 
+**Action type**: `command` + `prompt`
+
 **Steps**:
-1. Runs `ensure-running.py` (auto-start if server is down)
-2. Calls `summarize_scope()` for state review
+1. **`command`**: Runs `craft-memory ensure` → ensures server is up
+2. **`prompt`**: Calls `summarize_scope()` for state review
 3. Searches for consolidation candidates
 4. Identifies facts to promote from memories
 5. Checks stale loops (>30 days)
@@ -562,23 +574,29 @@ Added pattern to allow `ensure-running.py` even in safe mode:
 **Event**: Cron `0 10 * * 1` (Monday 10:00, timezone Europe/Rome)
 **Labels**: `scheduled`, `weekly-review`
 
+**Action type**: `command` + `prompt`
+
 **Steps**:
-1. `memory_stats()` overview
-2. `memory_diff()` analyze week changes
-3. `list_procedures()` + `get_procedure_outcomes()` health check
-4. `get_high_quality_sessions()` quality report
-5. Recommendations: deprecate, promote, close
+1. **`command`**: Runs `craft-memory ensure`
+2. **`prompt`**: `memory_stats()` overview
+3. `memory_diff()` analyze week changes
+4. `list_procedures()` + `get_procedure_outcomes()` health check
+5. `get_high_quality_sessions()` quality report
+6. Recommendations: deprecate, promote, close
 
 ### 5.11 SchedulerTick — "Memory: Monthly Archive"
 
 **Event**: Cron `0 3 1 * *` (1st of month 03:00, timezone Europe/Rome)
 **Labels**: `scheduled`, `monthly-archive`
 
+**Action type**: `command` + `prompt`
+
 **Steps**:
-1. `summarize_scope()` → save as milestone
-2. `export_session_traces()` training data
-3. `run_maintenance()` aggressive cleanup + VACUUM
-4. Archive report with stats
+1. **`command`**: Runs `craft-memory ensure`
+2. **`prompt`**: `summarize_scope()` → save as milestone
+3. `export_session_traces()` training data
+4. `run_maintenance()` aggressive cleanup + VACUUM
+5. Archive report with stats
 
 ### 5.12 LabelAdd — "Memory: Promote Important/Fact-Candidate/Procedure-Candidate Labels"
 
@@ -683,6 +701,20 @@ All declare `requiredSources: [memory]` in their YAML frontmatter.
 | | Detail |
 |---|---|
 | **Problem** | `remember()` returned "Duplicate memory skipped" on every call. `memories COUNT` stayed 0 despite the server being healthy. |
+
+### 7.9 Windows Job Object kills server on Craft Agents restart
+
+| | Detail |
+|---|---|
+| **Problem** | Craft Memory server (port 8392) is killed when Craft Agents (Electron) restarts. On Windows, `DETACHED_PROCESS` only detaches the console — the process remains in the parent's Job Object and is terminated when Craft Agents exits. |
+| **Root cause** | Windows Job Object: all child processes are terminated when the parent process exits, regardless of `DETACHED_PROCESS` or `CREATE_NEW_PROCESS_GROUP` flags. |
+| **Trigger** | Craft Agents restart, app update, system reboot. |
+| **Fix** | Changed 5 automations (SessionStart, SessionEnd, SchedulerTick Daily/Weekly/Monthly) from `"type": "prompt"` (LLM-interpreted text — fragile) to `"type": "command"` + `"type": "prompt"`. The `command` action executes `craft-memory ensure` as a shell command **deterministically**, before the LLM receives any instructions. This guarantees the server is running when the agent tries to use memory tools. |
+| **Why prompt failed** | The old SessionStart prompt said "Run: craft-memory ensure" — text that the agent had to interpret and execute. If the agent skipped it or couldn't run shell commands (permissions, missing PATH), the server stayed down. |
+| **Why command works** | `"type": "command"` in Craft Agents executes the shell command directly via OS, without any LLM interpretation. It runs first, then the `prompt` action sends instructions to the agent. |
+| **Automations changed** | `SessionStart`, `SessionEnd`, `SchedulerTick` (Daily Maintenance, Weekly Review Report, Monthly Archive) — 5 total |
+| **Relevant files** | `~/.craft-agent/workspaces/{workspace}/automations.json` |
+| **Date** | 2026-05-02 |
 | **Root cause** | `register_session()` was never called → `sessions` table empty → `memories` has `FOREIGN KEY(session_id) REFERENCES sessions(craft_session_id)` → `INSERT OR IGNORE` silently discards FK violations, reporting them as duplicates. |
 | **Evidence** | `facts = 13` (working, no FK), `sessions = 0`, `memories = 0`. |
 | **Fix** | Added auto-call `_db_register_session(conn, CRAFT_SESSION_ID, WORKSPACE_ID)` in `_get_conn()`, immediately after connection creation. `register_session` uses `INSERT OR IGNORE` → idempotent. |
@@ -782,9 +814,12 @@ In `~/.craft-agent/workspaces/{WS_ID}/config.json`, add `"memory"` to `enabledSo
 ### Step 5: Configure automations
 
 Copy `automations.json` to the workspace, adapting:
-- The paths of `ensure-running.py` to your system
 - The timezone in SchedulerTick
 - Python paths in `start-http.bat` (Windows) or `start-memory.sh` (macOS/Linux)
+
+**Important**: The automations use `"type": "command"` actions to run `craft-memory ensure` before each `"type": "prompt"` action. This is intentional — `command` actions execute shell commands deterministically without LLM interpretation, guaranteeing the MCP server is running before the agent attempts memory operations. Do not change these to `prompt` actions.
+
+See [§7.9](#79-windows-job-object-kills-server-on-craft-agents-restart) for details on why `command` actions are needed (Windows Job Object kills child processes on parent exit).
 
 ### Step 6: Copy the skills
 
@@ -968,3 +1003,112 @@ All thresholds are tunable via environment variables. The initial defaults favor
 ---
 
 *End of documentation*
+
+---
+
+## 11. Session Scanner
+
+### 11.1 Overview
+
+The Session Scanner (`scripts/session-scanner.py`) is a standalone CLI tool that extracts knowledge from Craft Agents session files and saves it to Craft Memory. It bridges the gap between raw session data (JSONL files) and structured memory (episodic memories, facts, open loops).
+
+**Problem**: Not all sessions trigger the SessionEnd automation. Sessions may be abandoned, interrupted, or the automation may fail. Valuable decisions, discoveries, and facts are lost.
+
+**Solution**: A lightweight scanner that reads session metadata, filters out automation sessions, extracts user messages, classifies content using deterministic rules (no LLM tokens), and saves via REST API.
+
+### 11.2 Architecture
+
+```
+Session Scanner (CLI)
+       |
+       |--- read session.jsonl (filesystem)
+       |--- filter: skip active, automation, too-short sessions
+       |--- extract user messages only (skip tool calls)
+       |--- classify_content() -> DISCARD/EPISODIC/FACT_CANDIDATE/OPEN_LOOP
+       |--- POST /api/memories (REST)
+       |--- POST /api/loops (REST)
+       |--- track state in .session-scanner-state.json
+```
+
+### 11.3 Key design decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Standalone CLI, not MCP tool** | Filesystem I/O doesn't belong in an MCP server. The CLI runs on-demand or via automation. |
+| **Deterministic classification** | `classify_content()` uses pattern matching (no LLM). Zero cost per scan. |
+| **REST API, not MCP** | The craft-memory server already exposes `/api/*` endpoints. No additional dependencies. |
+| **State file tracking** | `.session-scanner-state.json` tracks processed sessions to avoid re-scans. |
+| **Automation filter** | Sessions named "Memory: ..." or "Session: ..." are skipped — they contain no real user content. |
+
+### 11.4 Classification rules
+
+| Class | Trigger | Action | Importance |
+|-------|---------|--------|------------|
+| DISCARD | Content <20 chars, trivial responses ("ok", "procedi") | Skipped | 0 |
+| EPISODIC (bugfix) | Keywords: bug, fix, errore, non funziona | `remember(category=bugfix)` | 8 |
+| EPISODIC (decision) | Keywords: ho deciso, useremo, refactoring, migriamo | `remember(category=decision)` | 8 |
+| EPISODIC (discovery) | Keywords: scoperto, trovato, identificato, emerso | `remember(category=discovery)` | 7 |
+| EPISODIC (general) | Default for meaningful messages | `remember(category=note)` | 4 |
+| FACT_CANDIDATE | Keywords: usa, utilizza, configurato, versione | `remember(tags=[fact-candidate])` | 6 |
+| OPEN_LOOP | Keywords: da fare, todo, bloccato, pending | `POST /api/loops` | 6 |
+| PROCEDURE_CANDIDATE | >=2 of "step 1/2/3/4/5" | — | 7 |
+
+### 11.5 CLI usage
+
+```bash
+# Scan workspace (default: auresys-backend)
+craft-memory scan
+
+# Dry run (preview only)
+craft-memory scan --dry-run
+
+# Re-scan already processed sessions
+craft-memory scan --force
+
+# Verbose output
+craft-memory scan --verbose
+
+# JSON output (for scripting)
+craft-memory scan --json
+
+# Custom workspace path
+craft-memory scan ~/.craft-agent/workspaces/my-workspace
+```
+
+### 11.6 Automation
+
+The scanner runs weekly via SchedulerTick automation:
+
+```json
+{
+  "name": "Memory: Weekly Session Scan",
+  "cron": "0 9 * * 1",
+  "timezone": "Europe/Rome",
+  "actions": [
+    {
+      "type": "command",
+      "command": "python -m craft_memory_mcp.cli scan",
+      "timeout": 120000
+    }
+  ]
+}
+```
+
+### 11.7 Real-world results (2026-05-02)
+
+| Metric | Value |
+|--------|-------|
+| Total sessions scanned | **17** |
+| Sessions skipped | **39** (22 automation, 13 active/short) |
+| New memories saved | **199** |
+| New facts saved | **8** |
+| New open loops created | **7** |
+| Total messages processed | **~5,000** |
+| Cost (API tokens) | **$0.00** (deterministic rules only) |
+| Execution time | **~5 seconds** |
+
+### 11.8 Duplication prevention
+
+- **State file**: `.session-scanner-state.json` tracks `session_id → memories_saved` per workspace
+- **API dedup**: `POST /api/memories` uses content hash dedup — duplicates return `{"duplicate": true}` without saving
+- **`--force` flag**: Re-scans everything; duplicates are silently skipped by the API

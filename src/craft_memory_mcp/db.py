@@ -167,14 +167,31 @@ def complete_session(conn: sqlite3.Connection, craft_session_id: str) -> None:
 
 # ─── Memory CRUD ─────────────────────────────────────────────────────
 
+# Parole corte ma semanticamente ricche da preservare nell'estrazione FTS
+_SHORT_WORD_WHITELIST: set[str] = {
+    "fix", "git", "api", "db", "ui", "ux", "url", "cli", "mcp", "ssh",
+    "tls", "ssl", "dns", "sql", "pdf", "xml", "csv", "json", "yaml",
+    "toml", "aws", "gcp", "vpc", "iot", "sdk", "rpc", "gpu", "cpu",
+    "ram", "vpn", "lan", "wan", "www", "cdn", "img", "svg", "png",
+    "jpg", "gif", "ico", "css", "html", "jsx", "tsx", "npm", "yarn",
+    "dot", "env", "cfg", "yml", "log", "pid", "os", "ip", "io",
+    "pr", "feat", "docs", "refactor", "bug", "hotfix", "wip",
+    "cicd", "auth", "oauth", "jwt", "oidc", "http", "https",
+    "smtp", "pop3", "imap", "tcp", "udp", "dhcp", "dns",
+}
+
+
 def _extract_fts_keywords(text: str, max_words: int = 8) -> str | None:
     """Extract FTS5-safe keywords from text for similarity search.
 
     Returns an OR-joined query string or None if no suitable keywords found.
+    Text window increased to 200 chars (was 80) to capture more content
+    past structured headers like "DECISION:" or "FIX:".
+    Short words (2-3 chars) are preserved if in _SHORT_WORD_WHITELIST.
     """
-    raw = text[:80].split()
+    raw = text[:200].split()
     words = [re.sub(r"[^a-zA-Z0-9]", "", w) for w in raw]
-    words = [w for w in words if len(w) > 3][:max_words]
+    words = [w for w in words if len(w) > 2 or w.lower() in _SHORT_WORD_WHITELIST][:max_words]
     if not words:
         return None
     return " OR ".join(words)
@@ -234,15 +251,38 @@ def _auto_link_similar(
 
     linked = 0
     for row in rows:
+        score = abs(row["score"])
+        # Forward edge: new memory → similar memory
         rel_id = link_memories(
             conn, memory_id, row["id"], "semantically_similar_to",
             workspace_id, "inferred",
-            round(min(1.0, abs(row["score"]) / 8.0), 3),
-            role="context", weight=round(min(1.0, abs(row["score"]) / 8.0), 3),
+            round(min(1.0, score / 8.0), 3),
+            role="context", weight=round(min(1.0, score / 8.0), 3),
             is_manual=False,
         )
         if rel_id is not None:
             linked += 1
+
+        # Reverse edge: similar memory → new memory (if it doesn't exist yet)
+        # This ensures the knowledge graph is bidirectional even when
+        # _auto_link_similar is called only for new memories.
+        existing_reverse = conn.execute(
+            """SELECT id FROM memory_relations
+               WHERE source_id = ? AND target_id = ? AND workspace_id = ?
+               AND relation = 'semantically_similar_to'""",
+            (row["id"], memory_id, workspace_id),
+        ).fetchone()
+        if not existing_reverse:
+            rev_id = link_memories(
+                conn, row["id"], memory_id, "semantically_similar_to",
+                workspace_id, "inferred",
+                round(min(1.0, score / 8.0), 3),
+                role="context", weight=round(min(1.0, score / 8.0), 3),
+                is_manual=False,
+            )
+            if rev_id is not None:
+                linked += 1
+
     if linked:
         conn.commit()
     return linked
@@ -770,6 +810,15 @@ def summarize_scope(
     if scope != "all":
         params_mem.append(scope)
 
+    # Get total count first
+    count_row = conn.execute(
+        f"""SELECT count(*) AS cnt FROM memories
+            WHERE workspace_id = ?
+            {scope_filter}""",
+        params_mem,
+    ).fetchone()
+    total_count = count_row["cnt"] if count_row else 0
+
     recent_rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
@@ -819,6 +868,7 @@ def summarize_scope(
         "open_loops": [dict(r) for r in loops],
         "latest_summary": latest,
         "memory_count": len(recent),
+        "total_memory_count": len(recent_rows),
         "fact_count": len(facts),
         "open_loop_count": len(loops),
     }

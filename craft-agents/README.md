@@ -37,7 +37,7 @@ Then add `"memory"` to the `enabledSourceSlugs` array in your workspace config.
 
 | Event | Name | What it does |
 |-------|------|-------------|
-| `SessionStart` | Memory: Recover Session Context | Ensures server is running, recovers recent memories and open loops. Instructs the agent to proactively trigger memory saves via labels. |
+| `SessionStart` | Memory: Recover Session Context | **`command` action**: runs `craft-memory ensure` (shell exec, deterministic) → **`prompt` action**: recovers recent memories and open loops, instructs agent on proactive label behavior. The `command` action runs before the LLM sees any prompt — guarantees server is up. |
 | `SessionEnd` | Memory: Save Session Handoff | Saves decisions, discoveries, facts; closes resolved loops; generates a handoff summary. |
 | `SessionEnd` | Memory: Batch Save Discoveries (complement) | After the handoff protocol, saves minor discoveries/changes/notes via `batch_remember()` for atomic search. |
 | `LabelAdd` | Memory: Promote Important/Fact-Candidate Labels | Triggered when agent adds `important` or `fact-candidate` label. Saves memories or facts automatically. |
@@ -52,6 +52,17 @@ Then add `"memory"` to the `enabledSourceSlugs` array in your workspace config.
 | `TaskCompleted` | Agentic: Track Task Completion | Records significant task completions; closes related open loops |
 | `TeammateIdle` | Agentic: Detect Idle Agent | Creates open loops when agents are detected idle; escalates on frequent idle events |
 | `PermissionDenied` | Agentic: Permission Bottleneck Tracker | Tracks permission denials; suggests rule exceptions for repeatedly blocked tools |
+
+## Automation action types: `command` vs `prompt`
+
+Craft Agents automations support two action types:
+
+- **`"type": "command"`** — executes a shell command directly (deterministic, no LLM interpretation)
+- **`"type": "prompt"`** — sends text to the LLM agent (interpreted, model-dependent, fragile)
+
+The memory automations use **both**: `command` for server startup (`craft-memory ensure`) and `prompt` for agent memory operations. The `command` action runs first, guaranteeing the MCP server is active before the agent sees any instructions.
+
+> **Why this matters**: When Craft Agents restarts on Windows, the child process (craft-memory server) is killed by Windows Job Objects. A `prompt` action saying "Run: craft-memory ensure" may be ignored or fail. A `command` action runs it directly via shell — always works.
 
 ## How the proactive trigger pattern works
 
@@ -86,3 +97,5 @@ A companion skill in `skills/session-manager/` provides natural-language query p
 Merge the automations from `automations.json` into your workspace `automations.json` (located at `~/.craft-agent/workspaces/{your-workspace}/automations.json`).
 
 The `craft-memory install` CLI command handles this automatically if you run it from the Craft Agents workspace.
+
+> **Note**: The automations use `"type": "command"` actions (`craft-memory ensure`) before `"type": "prompt"` actions. Keep this pattern — it ensures the server is running deterministically, without relying on LLM interpretation.

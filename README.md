@@ -51,6 +51,8 @@ craft-memory ensure
 
 The SessionStart automation will run `craft-memory ensure` automatically at the start of every session.
 
+**⚠️ Windows users**: When Craft Agents (Electron) closes, Windows Job Objects terminate child processes — even those started with `DETACHED_PROCESS`. The `SessionStart` automation handles this: it uses a **`command` action** (not `prompt`) to run `craft-memory ensure` deterministically at every session start, **before** the agent receives any instructions. See [Troubleshooting → Server killed on Craft Agents restart](#server-killed-on-craft-agents-restart-windows) for details.
+
 ---
 
 ## Quick Path
@@ -94,10 +96,12 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 
 **Session lifecycle:**
 
-1. **Session starts** → automation runs `craft-memory ensure` (starts server if down), then calls `get_recent_memory` + `list_open_loops` to recover context
+1. **Session starts** → automation runs `craft-memory ensure` via **command action** (shell exec, deterministic), then calls `get_recent_memory` + `list_open_loops` to recover context
 2. **During work** → agent calls `remember`, `upsert_fact`, `search_memory` as needed
-3. **Session ends** → automation saves decisions, discoveries, updates facts, generates handoff summary
-4. **Daily at 03:00** → SchedulerTick automation consolidates memories, promotes stable knowledge to facts, closes stale loops
+3. **Session ends** → automation runs `craft-memory ensure` via **command action**, then saves decisions, discoveries, updates facts, generates handoff summary
+4. **Daily at 03:00** → SchedulerTick automation runs `craft-memory ensure` via **command action**, then consolidates memories, promotes stable knowledge to facts, closes stale loops
+
+> **Why command actions?** Craft Agents automations support two action types: `prompt` (text sent to the LLM — fragile, depends on model interpretation) and `command` (shell command executed directly — deterministic, always runs). The memory automations use `command` actions for server startup and `prompt` actions for agent memory operations.
 
 ---
 
@@ -115,7 +119,7 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 | **Privacy stripping** | `<private>`, `<system-reminder>`, `<system>` blocks stripped before storage |
 | **Session summaries** | Structured handoff: decisions, facts learned, open loops, refs, next steps |
 | **Migration runner** | Versioned SQL migrations applied automatically on startup |
-| **4 automations** | SessionStart, SessionEnd, SchedulerTick, LabelAdd — all pre-configured |
+| **5+ automations** | SessionStart, SessionEnd, SchedulerTick (daily, weekly, monthly), LabelAdd (3 matchers), PreCompact, SessionStatusChange, FlagChange, PermissionModeChange, SubagentStart/Stop |
 | **4 skills** | memory-protocol, memory-start, memory-maintenance, session-handoff |
 | **Knowledge graph** | Directed edges between memories (`link_memories`) with typed relations: caused_by, contradicts, extends, implements, supersedes, semantically_similar_to |
 | **Confidence labels** | Facts and graph edges carry `confidence_type`: `extracted` (observed directly), `inferred` (derived), `ambiguous` (uncertain) |
@@ -283,6 +287,7 @@ craft-memory install --workspace PATH   # Install source into a workspace
 | "Not connected" / connection refused | HTTP server not running | Run `craft-memory ensure` |
 | Tools not available in session | Source not enabled | Add `"memory"` to `enabledSourceSlugs` in workspace config |
 | Automations fail silently | `permissionMode` not set | Set `"permissionMode": "allow-all"` on all 4 automations |
+| Server killed on Craft Agents restart (Windows) | Windows Job Object kills child processes on parent exit | Use `"type": "command"` in SessionStart automation (not `prompt`) to auto-start via shell — see [Automations → Action Types](#action-types) |
 | `remember()` returns "Duplicate" on first call | FK violation (sessions table empty) | Fixed in v0.1.0 — update if on older version |
 | `Session not found` after server restart | Stateful HTTP sessions | Fixed in v0.1.0 — uses `stateless_http=True` |
 
