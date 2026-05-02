@@ -83,7 +83,7 @@ const App = () => {
         CRAFT_API.recentMemories(null, 50),
         CRAFT_API.facts(20),
         CRAFT_API.loops(null, "open"),
-        CRAFT_API.relations(null, null).catch(() => []),
+        CRAFT_API.relations(null, null).then(r => { window.CRAFT.RELATIONS_LOADED = true; return r; }).catch(() => { window.CRAFT.RELATIONS_LOADED = true; return []; }),
         CRAFT_API.diff(null).catch(() => []),
       ]);
 
@@ -92,6 +92,7 @@ const App = () => {
 
       window.CRAFT = {
         ...window.CRAFT,
+        RELATIONS_LOADED: true,
         STATS: {
           memoriesTotal:   stats.total_memories    ?? 0,
           memoriesCore:    stats.core_memories     ?? 0,

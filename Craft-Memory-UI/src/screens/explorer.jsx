@@ -186,7 +186,9 @@ const ExplorerScreen = ({ onNavigate, action }) => {
   };
 
   const usingServerSearch = query.trim() && searchResults !== null;
-  const totalDb = window.CRAFT.STATS?.memoriesTotal || MEMORIES.length;
+  const totalDb = window.CRAFT.STATS?.memoriesTotal || 0;
+  const loadedCount = MEMORIES.length;
+  const hasMoreLocal = !usingServerSearch && !query.trim() && loadedCount < totalDb;
   const MAX_CONTENT_PREVIEW = 280;
 
   // Early return: loading state before MEMORIES arrive
@@ -300,7 +302,8 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         <div>
           <h1>Memory Explorer</h1>
           <div className="sub">
-            RRF hybrid search · FTS5 BM25 + Jaccard · {totalDb.toLocaleString()} total in DB
+            RRF hybrid search · FTS5 BM25 + Jaccard
+            {" · "}{usingServerSearch ? totalDb.toLocaleString() + " results via FTS5" : loadedCount.toLocaleString() + " loaded / " + totalDb.toLocaleString() + " total"}
             {" · "}{loadingRel ? "loading edges…" : relations.length.toLocaleString() + " graph edges"} · <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "1px 4px", borderRadius: 2, border: "1px solid var(--line)" }}>⌘K</kbd> to search
           </div>
         </div>
@@ -469,6 +472,16 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <div className="load-more">
             <button className="btn ghost" onClick={() => setShowCount(s => s + 50)}>
               Show 50 more ({filtered.length - showCount} remaining)
+            </button>
+          </div>
+        )}
+        {hasMoreLocal && (
+          <div className="load-more">
+            <button className="btn ghost" onClick={() => {
+              CRAFT_API.recentMemories(null, Math.min(500, loadedCount + 50))
+                .then((rows) => { window.CRAFT.MEMORIES = rows; setShowCount(s => Math.min(s, rows.length)); window.CRAFT.STATS.memoriesTotal = Math.max(window.CRAFT.STATS.memoriesTotal || 0, rows.length); setSearchResults(null); document.querySelector('[class*="res-card"]')?.scrollIntoView({ behavior: "smooth" }); });
+            }}>
+              Load more from server ({loadedCount} loaded, {Math.max(0, totalDb - loadedCount)} more available)
             </button>
           </div>
         )}
