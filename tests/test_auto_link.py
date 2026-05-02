@@ -93,9 +93,15 @@ def test_auto_link_similar():
         for e in edges:
             assert e['is_manual'] == 0, f"Edge should be is_manual=0, got {e['is_manual']}"
 
-        # Verify source is always the new memory
+        # Verify at least one edge originates from the new memory
+        # (edges are bidirectional, so only outbound edges have source_id == new_id)
+        outbound = [e for e in edges if e['source_id'] == new_id]
+        assert len(outbound) > 0, f"Expected at least 1 outbound edge from {new_id}, got 0"
+
+        # Verify every edge involves the new memory (either as source or target)
         for e in edges:
-            assert e['source_id'] == new_id, f"Expected source={new_id}, got {e['source_id']}"
+            assert e['source_id'] == new_id or e['target_id'] == new_id, \
+                f"Edge #{e['source_id']}->#{e['target_id']} does not involve new memory #{new_id}"
 
         print("  Test 1 PASSED: auto-linking creates edges for similar content")
     finally:
