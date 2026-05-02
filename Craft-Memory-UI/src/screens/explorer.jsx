@@ -1,4 +1,4 @@
-// Memory Explorer — FTS5-backed hybrid search + filters + result list
+// Memory Explorer — FTS5-backed hybrid search + filters + result list + graph preview
 const ExplorerScreen = ({ onNavigate, action }) => {
   const { MEMORIES, CATEGORIES, SCOPES, formatRelTime } = window.CRAFT;
 
@@ -13,10 +13,45 @@ const ExplorerScreen = ({ onNavigate, action }) => {
   const [searching, setSearching]         = React.useState(false);
   const [searchError, setSearchError]     = React.useState(null);
 
+  // ─── Graph relations (for edge counts and inline neighbors) ─────────
+  const [relations, setRelations] = React.useState(window.CRAFT.RELATIONS || []);
+  const [loadingRel, setLoadingRel] = React.useState(!window.CRAFT.RELATIONS_LOADED);
+
+  // ─── Pagination + expandable neighbors ──────────────────────────────
+  const [showCount, setShowCount]   = React.useState(50);
+  const [expandedCards, setExpandedCards] = React.useState(new Set());
+
   // ─── "Remember" modal state ─────────────────────────────────────────
   const [showRemember, setShowRemember] = React.useState(false);
 
   const inputRef = React.useRef(null);
+
+  // ─── Load relations if not already cached by Graph screen ───────────
+  React.useEffect(() => {
+    if (window.CRAFT.RELATIONS_LOADED) { setRelations(window.CRAFT.RELATIONS); setLoadingRel(false); return; }
+    CRAFT_API.relations(null, null)
+      .then((r) => {
+        const edges = Array.isArray(r) ? r : (r?.edges ?? []);
+        setRelations(edges);
+        window.CRAFT.RELATIONS = edges;
+        window.CRAFT.RELATIONS_LOADED = true;
+      })
+      .catch(() => { window.CRAFT.RELATIONS_LOADED = true; })
+      .finally(() => setLoadingRel(false));
+  }, []);
+
+  // ─── Helpers for graph data ─────────────────────────────────────────
+  function edgeCount(memId) {
+    return relations.filter(r => r.source === memId || r.target === memId).length;
+  }
+  function neighborEdges(memId) {
+    return relations.filter(r => r.source === memId || r.target === memId);
+  }
+  function toggleExpanded(memId) {
+    const next = new Set(expandedCards);
+    next.has(memId) ? next.delete(memId) : next.add(memId);
+    setExpandedCards(next);
+  }
 
   // React to routeArgs.action from sidebar MCP tool clicks
   React.useEffect(() => {
@@ -44,7 +79,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         .catch((e) => {
           console.warn("[explorer] search failed:", e.message);
           setSearchError(e.message);
-          setSearchResults(null); // fallback to local
+          setSearchResults(null);
         })
         .finally(() => setSearching(false));
     }, 300);
@@ -53,12 +88,21 @@ const ExplorerScreen = ({ onNavigate, action }) => {
 
   // ─── Filtered list (server results or local fallback) ───────────────
   const baseList = query.trim() && searchResults !== null ? searchResults : MEMORIES;
+
+  // Category counts: dynamic — reflect current search results, not total DB
+  const catCounts = React.useMemo(() => {
+    const counts = {};
+    for (const m of baseList) {
+      counts[m.category] = (counts[m.category] || 0) + 1;
+    }
+    return counts;
+  }, [baseList]);
+
   const filtered = React.useMemo(() => {
     let out = baseList.filter(m => {
       if (activeCats.size > 0 && !activeCats.has(m.category)) return false;
       if (activeScope !== "all" && m.scope !== activeScope) return false;
       if (coreOnly && !m.isCore) return false;
-      // Local fallback filtering only when not using server results
       if (query.trim() && searchResults === null) {
         const q = query.toLowerCase();
         const hay = (m.content + " " + m.tags.join(" ")).toLowerCase();
@@ -70,6 +114,10 @@ const ExplorerScreen = ({ onNavigate, action }) => {
     else if (sortBy === "recent") out = [...out].sort((a, b) => b.ts - a.ts);
     return out;
   }, [query, searchResults, activeCats, activeScope, coreOnly, sortBy]);
+
+  // Pagination
+  const displayed = filtered.slice(0, showCount);
+  const hasMore = filtered.length > showCount;
 
   const highlight = (text, q) => {
     if (!q.trim()) return text;
@@ -85,7 +133,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
   };
 
   const usingServerSearch = query.trim() && searchResults !== null;
-  const totalDb = window.CRAFT.STATS.memoriesTotal;
+  const totalDb = window.CRAFT.STATS?.memoriesTotal || MEMORIES.length;
 
   return (
     <div className="exp">
@@ -124,13 +172,15 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         .sort-pill { padding: 3px 8px; font-family: var(--font-mono); font-size: 10px; border-radius: 999px; cursor: pointer; color: var(--ink-2); border: 1px solid transparent; }
         .sort-pill:hover { color: var(--ink-0); }
         .sort-pill.on { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-soft); }
-        .res-card { padding: 14px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+        .res-card { padding: 14px 16px; border-bottom: 1px solid var(--line); cursor: default; }
         .res-card:hover { background: var(--bg-2); }
         .res-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
-        .res-id { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+        .res-id { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); cursor: pointer; }
+        .res-id:hover { color: var(--accent); }
         .res-cat { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px; border-radius: 3px; }
         .res-meta { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); margin-left: auto; display: flex; gap: 10px; align-items: center; }
-        .res-content { font-size: 13.5px; color: var(--ink-0); line-height: 1.55; }
+        .res-content { font-size: 13.5px; color: var(--ink-0); line-height: 1.55; cursor: pointer; }
+        .res-content:hover { color: var(--accent); }
         .res-content mark { background: oklch(0.78 0.18 var(--accent-h) / 0.25); color: var(--ink-0); padding: 1px 2px; border-radius: 2px; }
         .res-tags { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
         .res-rank { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
@@ -139,6 +189,16 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         .empty-state { padding: 60px 20px; text-align: center; color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; }
         .search-badge { padding: 2px 8px; border-radius: 999px; font-family: var(--font-mono); font-size: 10px; background: var(--accent-soft); color: var(--accent); border: 1px solid oklch(0.78 0.18 var(--accent-h) / 0.3); }
         .search-err { padding: 8px 14px; font-family: var(--font-mono); font-size: 11px; color: var(--critical); border-bottom: 1px solid var(--line); }
+        /* ── Graph edge badge / inline neighbors ── */
+        .edge-badge { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 10px; color: var(--ink-2); cursor: pointer; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); }
+        .edge-badge:hover { background: var(--bg-2); color: var(--accent); }
+        .edge-badge.on { background: var(--accent-soft); color: var(--accent); }
+        .neighbor-list { margin-top: 6px; padding-left: 8px; border-left: 2px solid var(--line); font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+        .neighbor-item { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--ink-2); padding: 2px 4px; border-radius: 2px; }
+        .neighbor-item:hover { background: var(--bg-3); color: var(--ink-0); }
+        .neighbor-item .arrow { color: var(--accent); font-size: 10px; }
+        /* ── Pagination load-more ── */
+        .load-more { padding: 16px; text-align: center; }
         /* ── InsertMemoryModal ── */
         .imm-overlay { position: fixed; inset: 0; background: rgba(5,7,13,0.82); display: flex; align-items: center; justify-content: center; z-index: 2000; backdrop-filter: blur(4px); }
         .imm-box { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 28px; width: 520px; display: flex; flex-direction: column; gap: 18px; box-shadow: var(--glow); }
@@ -160,7 +220,6 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         <InsertMemoryModal
           onClose={() => setShowRemember(false)}
           onSaved={(mem) => {
-            // Prepend to global MEMORIES so Dashboard/Explorer reflect it
             window.CRAFT.MEMORIES = [mem, ...window.CRAFT.MEMORIES];
             setShowRemember(false);
           }}
@@ -172,6 +231,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <h1>Memory Explorer</h1>
           <div className="sub">
             RRF hybrid search · FTS5 BM25 + Jaccard · {totalDb.toLocaleString()} total in DB
+            {" · "}{relations.length.toLocaleString()} graph edges
           </div>
         </div>
         <button className="btn primary" onClick={() => setShowRemember(true)}>
@@ -187,13 +247,14 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           placeholder='"transport" OR scope:project tag:fts5'
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); e.target.blur(); } }}
           autoFocus
         />
         <span className="syntax mono">)</span>
         {searching && <span className="search-spinner" />}
         {usingServerSearch && !searching && <span className="search-badge">FTS5</span>}
-        {query && <span className="clear" onClick={() => setQuery("")}><Icon name="x" size={12} /></span>}
-        <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "2px 5px", borderRadius: 3, border: "1px solid var(--line)" }}>↵</kbd>
+        {query && <span className="clear" onClick={() => { setQuery(""); inputRef.current?.focus(); }}><Icon name="x" size={12} /></span>}
+        <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "2px 5px", borderRadius: 3, border: "1px solid var(--line)" }}>Esc ↵</kbd>
       </div>
 
       <div className="exp-side">
@@ -201,7 +262,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <div className="filter-h">Category</div>
           <div className="filter-body">
             {CATEGORIES.map(c => {
-              const count = MEMORIES.filter(m => m.category === c.id).length;
+              const count = catCounts[c.id] || 0;
               const on = activeCats.has(c.id);
               return (
                 <div key={c.id} className={"filter-item" + (on ? " on" : "")} onClick={() => toggleCat(c.id)}>
@@ -219,7 +280,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <div className="filter-body">
             {["all", ...SCOPES].map(s => {
               const on = activeScope === s;
-              const count = s === "all" ? MEMORIES.length : MEMORIES.filter(m => m.scope === s).length;
+              const count = s === "all" ? baseList.length : baseList.filter(m => m.scope === s).length;
               return (
                 <div key={s} className={"filter-item" + (on ? " on" : "")} onClick={() => setActiveScope(s)}>
                   <span>{s}</span>
@@ -243,6 +304,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
         <div className="results-h">
           <span className="count-big">{filtered.length}</span>
           <span>results</span>
+          {showCount < filtered.length && <span>· showing {Math.min(showCount, filtered.length)}</span>}
           {usingServerSearch && <span>· <span className="mono" style={{ color: "var(--accent)" }}>FTS5 "{query}"</span></span>}
           {!usingServerSearch && query && <span>· local filter <span className="mono" style={{ color: "var(--ink-3)" }}>"{query}"</span></span>}
           <div className="sort-pills">
@@ -262,32 +324,71 @@ const ExplorerScreen = ({ onNavigate, action }) => {
               {searching ? "Searching…" : "No results · try clearing filters or relaxing the query"}
             </div>
           )}
-          {filtered.map((m, i) => (
-            <div key={m.id} className="res-card" onClick={() => onNavigate("graph", { focusId: m.id })}>
-              <div className="res-top">
-                <span className="res-id">#{m.id}</span>
-                <span className="res-cat" style={{ color: catColor(m.category), background: catColor(m.category) + "1f" }}>{m.category}</span>
-                <span className="chip muted">{m.scope}</span>
-                {m.isCore && <span className="chip accent"><Icon name="core" size={10} /> core</span>}
-                <span className="chip muted">{m.confidence}</span>
-                <div className="res-meta">
-                  <span>rrf #{i+1}</span>
-                  <span>·</span>
-                  <span>{formatRelTime(m.ts)}</span>
-                  <div className="res-rank">
-                    <span>imp</span>
-                    <div className="bar"><div style={{ width: (m.importance * 100) + "%" }} /></div>
-                    <span>{m.importance.toFixed(2)}</span>
+          {displayed.map((m, i) => {
+            const eCount = edgeCount(m.id);
+            const expanded = expandedCards.has(m.id);
+            return (
+              <div key={m.id} className="res-card">
+                <div className="res-top">
+                  <span className="res-id" onClick={() => onNavigate("graph", { focusId: m.id })}>#{m.id}</span>
+                  <span className="res-cat" style={{ color: catColor(m.category), background: catColor(m.category) + "1f" }}>{m.category}</span>
+                  <span className="chip muted">{m.scope}</span>
+                  {m.isCore && <span className="chip accent"><Icon name="core" size={10} /> core</span>}
+                  <span className="chip muted">{m.confidence}</span>
+                  {eCount > 0 && (
+                    <span className="edge-badge" onClick={() => toggleExpanded(m.id)}
+                      title={`${eCount} edge${eCount > 1 ? "s" : ""} — click to ${expanded ? "hide" : "show"}`}>
+                      <Icon name="link" size={9} /> {eCount} edge{eCount > 1 ? "s" : ""}
+                    </span>
+                  )}
+                  <div className="res-meta">
+                    <span>#{i + 1}</span>
+                    <span>·</span>
+                    <span>{formatRelTime ? formatRelTime(m.ts) : new Date(m.ts).toLocaleDateString()}</span>
+                    <div className="res-rank">
+                      <span>imp</span>
+                      <div className="bar"><div style={{ width: Math.round(m.importance * 100) + "%" }} /></div>
+                      <span>{m.importance.toFixed(2)}</span>
+                    </div>
                   </div>
                 </div>
+                <div className="res-content" onClick={() => onNavigate("graph", { focusId: m.id })}>
+                  {highlight(m.content, query)}
+                </div>
+                <div className="res-tags">
+                  {m.tags.map(t => <span key={t} className="chip muted"><Icon name="tag" size={9} /> {t}</span>)}
+                </div>
+                {expanded && eCount > 0 && (
+                  <div className="neighbor-list">
+                    {neighborEdges(m.id).slice(0, 10).map((e, j) => {
+                      const otherId = e.source === m.id ? e.target : e.source;
+                      return (
+                        <div key={j} className="neighbor-item" onClick={() => onNavigate("graph", { focusId: otherId })}>
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)" }}>#{otherId}</span>
+                          <span className="arrow">─{e.relation}→</span>
+                          <span style={{ fontSize: 10, color: "var(--ink-3)" }}>w={e.weight.toFixed(2)}</span>
+                        </div>
+                      );
+                    })}
+                    {eCount > 10 && (
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", padding: "2px 4px" }}>
+                        … and {eCount - 10} more — <span style={{ cursor: "pointer", color: "var(--accent)", textDecoration: "underline" }} onClick={() => onNavigate("graph", { focusId: m.id })}>view in graph</span>
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
-              <div className="res-content">{highlight(m.content, query)}</div>
-              <div className="res-tags">
-                {m.tags.map(t => <span key={t} className="chip muted"><Icon name="tag" size={9} /> {t}</span>)}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
+
+        {hasMore && (
+          <div className="load-more">
+            <button className="btn ghost" onClick={() => setShowCount(s => s + 50)}>
+              Show 50 more ({filtered.length - showCount} remaining)
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -299,7 +400,6 @@ const InsertMemoryModal = ({ onClose, onSaved }) => {
   const [category, setCategory] = React.useState("note");
   const [scope, setScope]       = React.useState("workspace");
   const [importance, setImportance] = React.useState(5);
-  const [isCore, setIsCore]     = React.useState(false);
   const [tags, setTags]         = React.useState("");
   const [saving, setSaving]     = React.useState(false);
   const [error, setError]       = React.useState(null);
@@ -316,7 +416,6 @@ const InsertMemoryModal = ({ onClose, onSaved }) => {
       category,
       scope,
       importance,
-      is_core: isCore,
       tags: tagList,
     })
       .then((res) => onSaved(res))
@@ -373,17 +472,6 @@ const InsertMemoryModal = ({ onClose, onSaved }) => {
             value={tags}
             onChange={(e) => setTags(e.target.value)}
           />
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span
-            className={"switch" + (isCore ? " on" : "")}
-            onClick={() => setIsCore(!isCore)}
-            style={{ cursor: "pointer" }}
-          />
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink-1)" }}>
-            Mark as Core (immune to decay)
-          </span>
         </div>
 
         {error && <div style={{ color: "var(--critical)", fontFamily: "var(--font-mono)", fontSize: 12 }}>Error: {error}</div>}
