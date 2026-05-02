@@ -1,0 +1,17 @@
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything
+* @matrixNeo76
+
+# Core source code — requires maintainer review
+/src/ @matrixNeo76
+
+# Tests
+/tests/ @matrixNeo76
+
+# Documentation
+/docs/ @matrixNeo76
+*.md @matrixNeo76
+
+# CI/CD
+/.github/ @matrixNeo76

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / Support
+    url: https://github.com/matrixNeo76/craft-memory/discussions
+    about: Ask questions and discuss usage in GitHub Discussions
