@@ -322,9 +322,13 @@ def remember(
         # Auto-link similar memories (fire-and-forget, best-effort)
         _auto_link_similar(conn, new_id, workspace_id)
         return new_id
-    except sqlite3.IntegrityError:
-        # Duplicate (workspace_id, content_hash) - silently skip
-        return None
+    except sqlite3.IntegrityError as exc:
+        err_str = str(exc)
+        if "UNIQUE" in err_str and "content_hash" in err_str:
+            # Duplicate (workspace_id, content_hash) — silently skip
+            return None
+        # FK or CHECK constraint violation — re-raise with context
+        raise ValueError(f"Cannot save memory: {err_str} (category='{category}', importance={importance}, session='{session_id}')") from exc
 
 
 def search_memory(
