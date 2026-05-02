@@ -98,6 +98,14 @@ const ExplorerScreen = ({ onNavigate, action }) => {
     }
   }, [action]);
 
+  const filterActive = activeCats.size > 0 || activeScope !== "all" || coreOnly;
+
+  function clearAllFilters() {
+    setActiveCats(new Set());
+    setActiveScope("all");
+    setCoreOnly(false);
+  }
+
   const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "var(--ink-2)";
 
   // ─── Debounced FTS5 server search ──────────────────────────────────
@@ -293,7 +301,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
           <h1>Memory Explorer</h1>
           <div className="sub">
             RRF hybrid search · FTS5 BM25 + Jaccard · {totalDb.toLocaleString()} total in DB
-            {" · "}{relations.length.toLocaleString()} graph edges · <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "1px 4px", borderRadius: 2, border: "1px solid var(--line)" }}>⌘K</kbd> to search
+            {" · "}{loadingRel ? "loading edges…" : relations.length.toLocaleString() + " graph edges"} · <kbd style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", background: "var(--bg-3)", padding: "1px 4px", borderRadius: 2, border: "1px solid var(--line)" }}>⌘K</kbd> to search
           </div>
         </div>
         <button className="btn primary" onClick={() => setShowRemember(true)}>
@@ -322,6 +330,13 @@ const ExplorerScreen = ({ onNavigate, action }) => {
       </div>
 
       <div className="exp-side">
+        {filterActive && (
+          <div className="filter-block">
+            <div className="toggle-line" onClick={clearAllFilters} style={{ justifyContent: "center", color: "var(--accent)", fontFamily: "var(--font-mono)", fontSize: 10 }}>
+              ✕ clear all filters
+            </div>
+          </div>
+        )}
         <div className="filter-block">
           <div className="filter-h">Category</div>
           <div className="filter-body">
@@ -399,7 +414,7 @@ const ExplorerScreen = ({ onNavigate, action }) => {
                   <span className="chip muted">{m.confidence}</span>
                   {eCount > 0 && (
                     <span className={"edge-badge" + (expanded ? " on" : "")} onClick={() => toggleExpanded(m.id)}
-                      title={`${eCount} edge${eCount > 1 ? "s" : ""}`}>
+                      title={(() => { try { const n = neighborEdges(m.id).slice(0, 5).map(e => { const o = e.source === m.id ? e.target : e.source; return "#"+o+" ("+e.relation+")"; }).join(", "); return n + (eCount > 5 ? " ... +"+(eCount-5)+" more" : ""); } catch(e) { return ""; } })()}>
                       ◆ {eCount}
                     </span>
                   )}
@@ -414,7 +429,8 @@ const ExplorerScreen = ({ onNavigate, action }) => {
                     </div>
                   </div>
                 </div>
-                <div className="res-content" onClick={() => onNavigate("graph", { focusId: m.id })}>
+                <div className="res-content" onClick={() => onNavigate("graph", { focusId: m.id })}
+                  title={contentLong && !showingFull ? m.content.slice(0, 500) + (m.content.length > 500 ? "..." : "") : ""}>
                   {highlight(showingFull ? m.content : m.content.slice(0, MAX_CONTENT_PREVIEW))}
                 </div>
                 {contentLong && (
@@ -490,7 +506,7 @@ const InsertMemoryModal = ({ onClose, onSaved }) => {
   };
 
   return (
-    <div className="imm-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="imm-overlay" onClick={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => { if (e.key === "Escape") onClose(); }} tabIndex={-1} style={{ outline: 0 }}>
       <div className={`imm-box${saving ? " imm-saving" : ""}`}>
         <div className="imm-title">
           <span><span style={{ color: "var(--accent)", fontFamily: "var(--font-mono)" }}>remember()</span> — New memory</span>
@@ -507,6 +523,9 @@ const InsertMemoryModal = ({ onClose, onSaved }) => {
             autoFocus
             onKeyDown={(e) => { if (e.key === "Enter" && e.metaKey) save(); }}
           />
+        </div>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", textAlign: "right" }}>
+          {content.length} chars
         </div>
 
         <div className="imm-row">
