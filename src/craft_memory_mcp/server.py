@@ -157,8 +157,13 @@ RECOMMENDED WORKFLOW:
   2. During work    → remember for decisions; upsert_fact for confirmed knowledge
   3. Session end    → summarize_scope for handoff
 
+KNOWLEDGE GRAPH: remember() now includes automatic linking — when a new memory is
+  saved, it searches for similar memories (FTS5 BM25) and creates INFERRED
+  'semantically_similar_to' edges for strong matches. Edges are is_manual=False
+  (prunable by daily maintenance). Use link_memories for manual curation.
+
 STABILITY-FIRST: Core promotion and fact promotion are always assisted or manual.
-Close-loop and link_memories are never automatic. Only store what has lasting value.""",
+Close-loop is never automatic. Only store what has lasting value.""",
 )
 
 # ─── Health check endpoint (HTTP transport only) ─────────────────────
@@ -762,7 +767,7 @@ def link_memories(
     role: str = "context",
     weight: float = 1.0,
 ) -> str:
-    """[graph] Create a directed relation between two memories (knowledge graph edge). Never automatic — always explicit.
+    """[graph] Create a directed relation between two memories (knowledge graph edge). Use for manual curation — remember() auto-links similar content.
 
     Args:
         source_id: Source memory ID

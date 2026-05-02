@@ -167,6 +167,87 @@ def complete_session(conn: sqlite3.Connection, craft_session_id: str) -> None:
 
 # ─── Memory CRUD ─────────────────────────────────────────────────────
 
+def _extract_fts_keywords(text: str, max_words: int = 8) -> str | None:
+    """Extract FTS5-safe keywords from text for similarity search.
+
+    Returns an OR-joined query string or None if no suitable keywords found.
+    """
+    raw = text[:80].split()
+    words = [re.sub(r"[^a-zA-Z0-9]", "", w) for w in raw]
+    words = [w for w in words if len(w) > 3][:max_words]
+    if not words:
+        return None
+    return " OR ".join(words)
+
+
+def _auto_link_similar(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    workspace_id: str,
+    limit: int = 3,
+) -> int:
+    """Find similar memories and create INFERRED semantically_similar_to edges.
+
+    Called after a new memory is inserted. Uses FTS5 BM25 to find the top-N
+    most similar memories (by shared keywords) and links them. No absolute
+    threshold — the FTS5 MATCH already guarantees keyword overlap, and BM25
+    ordering ensures only the most relevant ones are linked.
+
+    Edges are is_manual=False (prunable by maintenance).
+    Returns the number of edges created.
+    """
+    source = conn.execute(
+        "SELECT content FROM memories WHERE id = ? AND workspace_id = ?",
+        (memory_id, workspace_id),
+    ).fetchone()
+    if not source:
+        return 0
+
+    fts_query = _extract_fts_keywords(source["content"])
+    if not fts_query:
+        return 0
+
+    try:
+        rows = conn.execute(
+            """SELECT m.id, bm25(memories_fts) AS score
+               FROM memories m
+               JOIN memories_fts fts ON m.id = fts.rowid
+               WHERE memories_fts MATCH ?
+               AND m.workspace_id = ?
+               AND m.id != ?
+               AND (m.lifecycle_status = 'active' OR m.lifecycle_status IS NULL)
+               ORDER BY score ASC
+               LIMIT ?""",
+            [fts_query, workspace_id, memory_id, limit],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+
+    # Skip linking if BM25 score is not at least mildly negative,
+    # meaning the top match shares at least some meaningful overlap.
+    # This prevents linking to noise from very short or generic keywords.
+    if not rows:
+        return 0
+    best_score = rows[0]["score"]
+    if best_score >= -1.0:
+        return 0
+
+    linked = 0
+    for row in rows:
+        rel_id = link_memories(
+            conn, memory_id, row["id"], "semantically_similar_to",
+            workspace_id, "inferred",
+            round(min(1.0, abs(row["score"]) / 8.0), 3),
+            role="context", weight=round(min(1.0, abs(row["score"]) / 8.0), 3),
+            is_manual=False,
+        )
+        if rel_id is not None:
+            linked += 1
+    if linked:
+        conn.commit()
+    return linked
+
+
 def remember(
     conn: sqlite3.Connection,
     session_id: str,
@@ -178,7 +259,11 @@ def remember(
     source_session: str | None = None,
     tags: list[str] | None = None,
 ) -> int | None:
-    """Store a new episodic memory. Returns row id or None if duplicate."""
+    """Store a new episodic memory. Returns row id or None if duplicate.
+
+    After inserting, automatically links to similar memories via FTS5 BM25
+    similarity search. Edges are is_manual=False (prunable by daily maintenance).
+    """
     c_hash = _content_hash(content)
     now_iso = _now_iso()
     now_epoch = _now_epoch()
@@ -193,7 +278,10 @@ def remember(
              scope, source_session, c_hash, now_iso, now_epoch, tags_json),
         )
         conn.commit()
-        return cursor.lastrowid
+        new_id = cursor.lastrowid
+        # Auto-link similar memories (fire-and-forget, best-effort)
+        _auto_link_similar(conn, new_id, workspace_id)
+        return new_id
     except sqlite3.IntegrityError:
         # Duplicate (workspace_id, content_hash) - silently skip
         return None
