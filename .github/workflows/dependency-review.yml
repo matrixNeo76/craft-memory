@@ -1,0 +1,27 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          comment-summary-in-pr: true
+          fail-on-severity: high
+          deny-licenses: AGPL-1.0, AGPL-3.0, GPL-1.0, GPL-2.0, GPL-3.0, LGPL-1.0
+          allow-dependencies-licenses: |
+            Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense,
+            Python-2.0, MPL-2.0, LGPL-2.1, LGPL-3.0, CC0-1.0, CC-BY-4.0,
+            PSF-2.0, Zlib, PostgreSQL, Boost-1.0
