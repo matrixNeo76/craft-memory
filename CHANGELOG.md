@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.1.2](https://github.com/matrixNeo76/craft-memory/compare/v0.1.1...v0.1.2) (2026-05-03)
+
+
+### Features
+
+* add project:&lt;name&gt; tag to session scanner memories ([bc869de](https://github.com/matrixNeo76/craft-memory/commit/bc869de130f23267f586a83511002d3c5da3c5a1))
+* **automations:** add 9 new automations across 3 types + session-manager skill ([aa385a2](https://github.com/matrixNeo76/craft-memory/commit/aa385a2af030485ed2b3303125f8cbf84fbcfd96))
+* implement 13 automation expansion plan (4→13 automations) ([edc118c](https://github.com/matrixNeo76/craft-memory/commit/edc118c58fcf220229291fece49489baa67c1a32))
+* Knowledge Graph UI zoom/pan/drag + API /api/relations all-edges fix ([cdd5196](https://github.com/matrixNeo76/craft-memory/commit/cdd51966aa52f161690969d3605dfd233f8747ef))
+* lint_wiki, export_wiki, source_url migration — wiki health + Obsidian export + source tracking ([04fc750](https://github.com/matrixNeo76/craft-memory/commit/04fc750f49983c5b1d8d6903ed613e82f6703374))
+* Memory Explorer — edge counts, inline neighbors, pagination, Escape key, dynamic category counts ([488cde0](https://github.com/matrixNeo76/craft-memory/commit/488cde0b4876a27c624725cc03dd299b95aa48f0))
+* **memory:** add auto-linking in remember() via FTS5 BM25 + analysis docs ([14fd5fd](https://github.com/matrixNeo76/craft-memory/commit/14fd5fd090bbcb740f1c2ad10ee0e1d9e36f8957))
+* session scanner + fix Windows Job Object auto-restart ([ccf52db](https://github.com/matrixNeo76/craft-memory/commit/ccf52db8830bf0ff767e47308050461c2b12af19))
+* **ui:** Dashboard — lint_wiki health check + export_wiki panels integrated ([a4c6141](https://github.com/matrixNeo76/craft-memory/commit/a4c61418da3b7a4e92a4100db5f7597bc1410072))
+
+
+### Bug Fixes
+
+* auto-link test assertion for bidirectional edges ([3d56382](https://github.com/matrixNeo76/craft-memory/commit/3d563829cbee8e403a6cbe4d45cac1c3d439d111))
+* **automations:** resolve 6 critical issues found during review ([1f5d23c](https://github.com/matrixNeo76/craft-memory/commit/1f5d23ca896c82dffb208ba430198957e4db1cea))
+* **handoff:** fix unterminated string literal in buildMarkdown() ([07b60ad](https://github.com/matrixNeo76/craft-memory/commit/07b60ad623ca77dfabf33d060286276d814aab31))
+* Memory Explorer V4 — show accurate loaded/total counts, RELATIONS_LOADED flag, load-more from server ([8948c27](https://github.com/matrixNeo76/craft-memory/commit/8948c27d471af389338ae8c1de126c15dde757b7))
+* remember() silent duplicate on invalid category — now reports meaningful ValueError ([cfa3674](https://github.com/matrixNeo76/craft-memory/commit/cfa367405d5b25b0a4070184034ba9fe5323f91b))
+* test_bundle_workspace_isolation argument order ([cb358ec](https://github.com/matrixNeo76/craft-memory/commit/cb358ecbb08712209532dc7d97aa67a2d24301f7))
+* test_health_check version assertion ([e46da4f](https://github.com/matrixNeo76/craft-memory/commit/e46da4f8e1e605e910d6253adb4595457f7272f4))
+* **ui:** minor polish for loops and actions propagation ([c316a0a](https://github.com/matrixNeo76/craft-memory/commit/c316a0a868dbd2bcaf190472e110f5d131fc643f))
+* **ui:** Phase 2 — FTS5 search, InsertMemoryModal, clipboard, graph fixes ([02db46b](https://github.com/matrixNeo76/craft-memory/commit/02db46bf9ac0e9a54d13ead5f15a57cb8918eb92))
+* **ui:** resolve all DEBUG_PLAN criticalities ([fb83f24](https://github.com/matrixNeo76/craft-memory/commit/fb83f24f3d361b47ad907c74880454555ff5e9ab))
+
+
+### Performance
+
+* Memory Explorer v2 — O(1) edge lookups, memoized highlight, loading state, ⌘K, content truncation ([7452191](https://github.com/matrixNeo76/craft-memory/commit/7452191e5bc3ff837664f76ea7f52e0c9bfdc9d3))
+
+
+### Refactoring
+
+* **ui:** extract cache-bust to separate file, add fetch() patch ([7ce31d3](https://github.com/matrixNeo76/craft-memory/commit/7ce31d30a3e5c176c83d8887352b048e5c38ba0f))
+
+
+### Documentation
+
+* add automation expansion plan (13 automations, 7 phases) ([57d110f](https://github.com/matrixNeo76/craft-memory/commit/57d110f7fa3ad6933cedeb1b03b41f1c58f1e40f))
+* add final architectural analysis with 11-phase refactoring plan ([ffc5873](https://github.com/matrixNeo76/craft-memory/commit/ffc5873bf8c006372d71eef6350ca7386fe0bcfb))
+* add project-wide DEBUG_PLAN.md covering backend, db, and cli ([20bc1d0](https://github.com/matrixNeo76/craft-memory/commit/20bc1d0085a8f2d596e04516c4cb69f1565eadad))
+* add sources roadmap - todo list of 23 API/MCP candidates for workspace enrichment ([7a4b968](https://github.com/matrixNeo76/craft-memory/commit/7a4b96831f3857e21981337475b9b304d6856654))
+* README — knowledge base health (lint_wiki, export_wiki, source_url) explained in plain terms ([6641bad](https://github.com/matrixNeo76/craft-memory/commit/6641bad080548736dc24d2e451b94628565c7177))
+* **ui:** add DEBUG_PLAN.md from code audit ([5920dea](https://github.com/matrixNeo76/craft-memory/commit/5920dea9645bd110a68faf6e451a22aad5b2c595))
+* **ui:** add UI-specific README and ARCHITECTURE documentation ([6f13346](https://github.com/matrixNeo76/craft-memory/commit/6f13346ae458fc53bc85e6f34fea7bfe43359c4b))
+* **ui:** aggiorna DEBUG_PLAN con Phase 3 — Web Design, Responsiveness & Security audit ([062e13b](https://github.com/matrixNeo76/craft-memory/commit/062e13b8ff69f43ea71663c0a0b306fe1c5a8934))
+* **ui:** correct README and ARCHITECTURE to reflect actual backend integration ([1716c2c](https://github.com/matrixNeo76/craft-memory/commit/1716c2c7fa9cce48c8157f4117d7aa897fec3d39))
+* **ui:** enhance DEBUG_PLAN.md with date, progress tracking, and decisions log ([59d7703](https://github.com/matrixNeo76/craft-memory/commit/59d7703f2e13954ad7b50ac30e45a91e64228c3b))
+* **ui:** update DEBUG_PLAN.md with Phase 2 UI audit results ([175ff20](https://github.com/matrixNeo76/craft-memory/commit/175ff20564b45115862c516255054ac325fc14bb))
+
 ## [0.1.1](https://github.com/matrixNeo76/craft-memory/compare/v0.1.0...v0.1.1) (2026-05-01)
 
 
