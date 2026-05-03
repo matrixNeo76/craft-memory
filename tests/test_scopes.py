@@ -118,17 +118,23 @@ class TestGetMemoryBundle:
         # Workspace A
         db_a = init_db(tmp_db_dir / "ws_a.db")
         register_session(db_a, "sess-a", "workspace-a")
-        id_a = remember(db_a, "ws-a memory", "sess-a", "workspace-a")
+        id_a = remember(db_a, "sess-a", "workspace-a", "ws-a memory")
 
         # Workspace B
         db_b = init_db(tmp_db_dir / "ws_b.db")
         register_session(db_b, "sess-b", "workspace-b")
-        id_b = remember(db_b, "ws-b memory", "sess-b", "workspace-b")
+        id_b = remember(db_b, "sess-b", "workspace-b", "ws-b memory")
 
-        # Querying workspace-a using an ID that exists in workspace-b's DB but on workspace-a conn
-        # id_b is in a different DB file entirely — bundle should return empty for ws_a conn
-        results = get_memory_bundle(db_a, [id_b], "workspace-a")
-        assert results == []
+        # Querying workspace-a conn with ids from workspace-b's DB
+        # Since each DB has its own autoincrement, id values may collide.
+        # The important check is: returned content should be from workspace-a, not workspace-b.
+        results_self = get_memory_bundle(db_a, [id_a], "workspace-a")
+        assert len(results_self) == 1
+        assert results_self[0]["content"] == "ws-a memory"
+
+        results_cross = get_memory_bundle(db_a, [id_b], "workspace-b")
+        # Cross-workspace query on the wrong DB should return empty
+        assert results_cross == []
 
     def test_bundle_returns_full_fields(self, registered_conn):
         """Returned dicts contain id, content, scope, is_core, lifecycle_status."""
