@@ -2386,3 +2386,312 @@ def export_session_traces(
         return ""
     lines = [json.dumps(dict(r), default=str, ensure_ascii=False) for r in rows]
     return "\n".join(lines)
+
+
+def lint_wiki(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Health-check the knowledge base. Returns a diagnostic report.
+
+    Checks performed:
+    1. Contradictory facts — same key prefix, diverging values, high confidence
+    2. Orphan memories — no graph edges (source_id = id OR target_id = id)
+    3. Pending reviews — lifecycle_status = 'needs_review' not yet approved
+    4. Low-confidence facts — confidence < 0.5, candidates for verification
+    5. Unlinked high-importance memories — importance >= 8 but no edges
+    6. Memories with stale lifecycle or inconsistent states
+
+    Returns a dict with findings and suggestions.
+    """
+    report: dict[str, Any] = {
+        "contradictions": [],
+        "orphans": [],
+        "pending_reviews": [],
+        "low_confidence_facts": [],
+        "unlinked_high_importance": [],
+        "inconsistencies": [],
+        "summary": "",
+    }
+
+    # 1. Contradictory facts — find facts with same key prefix but different values
+    facts = conn.execute(
+        "SELECT key, value, confidence, confidence_type, created_at FROM facts WHERE workspace_id = ? ORDER BY key",
+        (workspace_id,),
+    ).fetchall()
+    key_groups: dict[str, list[dict]] = {}
+    for f in facts:
+        prefix = f["key"].rsplit("_", 1)[0] if "_" in f["key"] else f["key"]
+        if prefix not in key_groups:
+            key_groups[prefix] = []
+        key_groups[prefix].append(dict(f))
+    for prefix, group in key_groups.items():
+        if len(group) < 2:
+            continue
+        values = set(g["value"] for g in group)
+        if len(values) > 1:
+            report["contradictions"].append({
+                "prefix": prefix,
+                "keys": [g["key"] for g in group],
+                "values": [g["value"][:80] for g in group],
+                "notes": f"{len(group)} facts with same prefix '{prefix}' but different values",
+            })
+
+    # 2. Orphan memories — no incoming or outgoing edges
+    all_mem_ids = conn.execute(
+        "SELECT id FROM memories WHERE workspace_id = ? AND (lifecycle_status IS NULL OR lifecycle_status = 'active')",
+        (workspace_id,),
+    ).fetchall()
+    for row in all_mem_ids:
+        mid = row["id"]
+        edge = conn.execute(
+            "SELECT id FROM memory_relations WHERE workspace_id = ? AND (source_id = ? OR target_id = ?) LIMIT 1",
+            (workspace_id, mid, mid),
+        ).fetchone()
+        if not edge:
+            mem = conn.execute(
+                "SELECT id, category, importance, content FROM memories WHERE id = ?",
+                (mid,),
+            ).fetchone()
+            if mem:
+                report["orphans"].append({
+                    "id": mem["id"],
+                    "category": mem["category"],
+                    "importance": mem["importance"],
+                    "preview": mem["content"][:80],
+                })
+
+    # 3. Pending reviews
+    reviews = conn.execute(
+        "SELECT id, content, importance FROM memories WHERE workspace_id = ? AND lifecycle_status = 'needs_review' ORDER BY importance DESC",
+        (workspace_id,),
+    ).fetchall()
+    for r in reviews:
+        report["pending_reviews"].append({
+            "id": r["id"],
+            "importance": r["importance"],
+            "preview": r["content"][:80],
+        })
+
+    # 4. Low-confidence facts
+    low_conf = conn.execute(
+        "SELECT key, value, confidence FROM facts WHERE workspace_id = ? AND confidence < 0.5 ORDER BY confidence ASC",
+        (workspace_id,),
+    ).fetchall()
+    for f in low_conf:
+        report["low_confidence_facts"].append({
+            "key": f["key"],
+            "value": f["value"][:80],
+            "confidence": f["confidence"],
+        })
+
+    # 5. High-importance memories without edges
+    high_no_edges = conn.execute(
+        """SELECT m.id, m.content, m.importance FROM memories m
+           WHERE m.workspace_id = ? AND m.importance >= 8
+           AND (m.lifecycle_status IS NULL OR m.lifecycle_status = 'active')
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_relations mr
+               WHERE mr.workspace_id = ? AND (mr.source_id = m.id OR mr.target_id = m.id)
+           )
+           ORDER BY m.importance DESC
+           LIMIT 20""",
+        (workspace_id, workspace_id),
+    ).fetchall()
+    for m in high_no_edges:
+        report["unlinked_high_importance"].append({
+            "id": m["id"],
+            "importance": m["importance"],
+            "preview": m["content"][:80],
+        })
+
+    # 6. Inconsistencies
+    invalid_lifecycle = conn.execute(
+        "SELECT id, lifecycle_status FROM memories WHERE workspace_id = ? AND lifecycle_status NOT IN ('active', 'superseded', 'invalidated', 'needs_review', NULL)",
+        (workspace_id,),
+    ).fetchall()
+    for m in invalid_lifecycle:
+        report["inconsistencies"].append({
+            "id": m["id"],
+            "issue": f"invalid lifecycle_status: {m['lifecycle_status']}",
+        })
+
+    # Summary
+    total = len(all_mem_ids)
+    total_facts = len(facts)
+    report["summary"] = (
+        f"Wiki health check complete: "
+        f"{len(report['contradictions'])} contradictions, "
+        f"{len(report['orphans'])} orphan memories (/{total}), "
+        f"{len(report['pending_reviews'])} pending reviews, "
+        f"{len(report['low_confidence_facts'])} low-confidence facts (/{total_facts}), "
+        f"{len(report['unlinked_high_importance'])} high-importance unlinked, "
+        f"{len(report['inconsistencies'])} inconsistencies"
+    )
+
+    return report
+
+
+def export_wiki(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    output_dir: str,
+    min_importance: int = 3,
+    max_pages: int = 500,
+) -> dict[str, Any]:
+    """Export memories as an interlinked markdown wiki (Obsidian-compatible).
+
+    Generates:
+      wiki/index.md       — catalog of all pages with metadata
+      wiki/pages/         — one markdown file per memory, with wikilinks to neighbors
+      wiki/edges.md       — summary of all graph connections
+      wiki/log.md         — chronological record of exports
+
+    Each page includes YAML frontmatter (tags, category, importance, source)
+    and [[wikilink]] references to connected memories.
+    """
+    import os
+    from datetime import datetime, timezone
+
+    base = os.path.abspath(output_dir)
+    pages_dir = os.path.join(base, "pages")
+    os.makedirs(pages_dir, exist_ok=True)
+
+    # Load all active memories
+    memories = conn.execute(
+        """SELECT m.id, m.content, m.category, m.importance, m.tags, m.created_at,
+                  m.scope, m.lifecycle_status, m.is_core
+           FROM memories m
+           WHERE m.workspace_id = ?
+           AND m.importance >= ?
+           AND (m.lifecycle_status IS NULL OR m.lifecycle_status = 'active')
+           ORDER BY m.importance DESC, m.created_at_epoch DESC
+           LIMIT ?""",
+        (workspace_id, min_importance, max_pages),
+    ).fetchall()
+
+    # Load all edges for this workspace
+    edges = conn.execute(
+        "SELECT source_id, target_id, relation, weight, role FROM memory_relations WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall()
+
+    # Build neighbor index
+    neighbors: dict[int, list[dict]] = {}
+    for e in edges:
+        s, t = e["source_id"], e["target_id"]
+        neighbors.setdefault(s, []).append({"other": t, "rel": e["relation"], "weight": e["weight"], "role": e["role"]})
+        neighbors.setdefault(t, []).append({"other": s, "rel": e["relation"], "weight": e["weight"], "role": e["role"]})
+
+    mem_map = {m["id"]: m for m in memories}
+    page_count = 0
+    error_count = 0
+
+    # Generate one page per memory
+    for m in memories:
+        mid = m["id"]
+        # Slug from first line of content
+        title_line = m["content"].split("\n")[0][:60].strip()
+        safe_name = re.sub(r"[^a-zA-Z0-9\-\s]", "", title_line)[:40].strip().replace(" ", "-").lower()
+        slug = f"mem-{mid}-{safe_name}" if safe_name else f"mem-{mid}"
+
+        # Parse tags
+        tags_list = []
+        if m["tags"]:
+            try:
+                tags_list = json.loads(m["tags"]) if isinstance(m["tags"], str) else m["tags"]
+            except (json.JSONDecodeError, TypeError):
+                tags_list = []
+
+        # Build wikilinks to neighbors
+        neighbor_links = []
+        nbrs = neighbors.get(mid, [])[:15]
+        for nb in nbrs:
+            other = mem_map.get(nb["other"])
+            if not other:
+                continue
+            other_title = other["content"].split("\n")[0][:60].strip()
+            other_slug = re.sub(r"[^a-zA-Z0-9\-\s]", "", other_title)[:40].strip().replace(" ", "-").lower()
+            other_name = f"mem-{nb['other']}-{other_slug}" if other_slug else f"mem-{nb['other']}"
+            neighbor_links.append(f"  [[{other_name}]] — {nb['rel']} (w={nb['weight']:.2f})")
+
+        # YAML frontmatter
+        frontmatter = (
+            "---\n"
+            f"id: {mid}\n"
+            f"title: \"{title_line}\"\n"
+            f"category: {m['category']}\n"
+            f"importance: {m['importance']}\n"
+            f"scope: {m['scope']}\n"
+            f"created: {m['created_at']}\n"
+            f"is_core: {'true' if m['is_core'] else 'false'}\n"
+            f"tags: {json.dumps(tags_list)}\n"
+            f"edges: {len(neighbors.get(mid, []))}\n"
+            "---\n\n"
+        )
+
+        # Page body
+        body_lines = [f"# {title_line}\n"]
+        body_lines.append(m["content"] + "\n\n")
+
+        if neighbor_links:
+            body_lines.append("## Connections\n\n")
+            body_lines.extend(neighbor_links)
+            body_lines.append("\n")
+
+        if tags_list:
+            body_lines.append("## Tags\n\n")
+            body_lines.append(" ".join(f"#{t}" for t in tags_list) + "\n")
+
+        try:
+            with open(os.path.join(pages_dir, f"{slug}.md"), "w", encoding="utf-8") as f:
+                f.write(frontmatter + "\n".join(body_lines))
+            page_count += 1
+        except OSError:
+            error_count += 1
+
+    # Generate index.md
+    index_lines = ["# Wiki Index\n", f"Generated: {datetime.now(timezone.utc).isoformat()[:19]}\n"]
+    index_lines.append(f"Total pages: {page_count} | Total edges: {len(edges)}\n\n")
+    index_lines.append("## By Category\n")
+    by_cat: dict[str, list[tuple[int, str, str]]] = {}
+    for m in memories:
+        title = m["content"].split("\n")[0][:60].strip()
+        by_cat.setdefault(m["category"], []).append((m["id"], title, m["tags"]))
+    for cat, items in sorted(by_cat.items()):
+        index_lines.append(f"\n### {cat} ({len(items)})\n")
+        for mid, title, tags in items:
+            index_lines.append(f"- [[mem-{mid}-]] — {title[:80]}")
+    try:
+        with open(os.path.join(base, "index.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(index_lines))
+    except OSError:
+        error_count += 1
+
+    # Generate edges.md
+    edge_lines = ["# Graph Edges\n", f"Total: {len(edges)} edges\n"]
+    for e in edges[:200]:
+        edge_lines.append(f"- [[mem-{e['source_id']}-]] --{e['relation']}--> [[mem-{e['target_id']}-]] (w={e['weight']:.2f})")
+    if len(edges) > 200:
+        edge_lines.append(f"\n… and {len(edges) - 200} more edges\n")
+    try:
+        with open(os.path.join(base, "edges.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(edge_lines))
+    except OSError:
+        error_count += 1
+
+    # Generate log.md (append)
+    log_line = f"## [{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}] export | {page_count} pages, {len(edges)} edges"
+    try:
+        with open(os.path.join(base, "log.md"), "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+    except OSError:
+        error_count += 1
+
+    return {
+        "page_count": page_count,
+        "edge_count": len(edges),
+        "output_dir": base,
+        "error_count": error_count,
+        "files": ["index.md", "edges.md", "log.md", f"pages/ ({page_count} files)"],
+    }

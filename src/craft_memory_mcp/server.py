@@ -105,6 +105,7 @@ from craft_memory_mcp.db import (
     get_memory_bundle as _db_get_memory_bundle,
     get_scope_ancestors as _db_get_scope_ancestors,
     search_facts as _db_search_facts,
+    lint_wiki as _db_lint_wiki,
     list_procedures as _db_list_procedures_all,
     find_consolidation_candidates as _db_find_consolidation_candidates,
     record_procedure_outcome as _db_record_procedure_outcome,
@@ -116,6 +117,7 @@ from craft_memory_mcp.db import (
     rate_session as _db_rate_session,
     get_high_quality_sessions as _db_get_high_quality_sessions,
     export_session_traces as _db_export_session_traces,
+    export_wiki as _db_export_wiki,
 )
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
@@ -1612,6 +1614,129 @@ def export_session_traces(min_score: float = 0.0, limit: int = 50) -> str:
     if not output:
         return "No rated sessions found. Use rate_session() to score sessions first."
     return output
+
+
+# ─── Tool: lint_wiki — health check for the knowledge base ────────────
+
+@mcp.tool()
+def lint_wiki() -> str:
+    """[admin] Health-check the knowledge base. Finds contradictions, orphans,
+    pending reviews, low-confidence facts, high-importance unlinked memories,
+    and lifecycle inconsistencies.
+
+    Returns a structured diagnostic report that can be filed back into
+    memory or reviewed manually. Run periodically to keep the knowledge
+    base healthy as it grows.
+    """
+    conn = _get_conn()
+    report = _db_lint_wiki(conn, WORKSPACE_ID)
+
+    lines = [f"=== Wiki Health Check — {WORKSPACE_ID} ===\n"]
+
+    # Contradictions
+    c = report["contradictions"]
+    lines.append(f"Contradictions ({len(c)}):")
+    for item in c[:10]:
+        lines.append(f"  • prefix '{item['prefix']}': {item['notes']}")
+        for k, v in zip(item["keys"][:3], item["values"][:3]):
+            lines.append(f"    - {k} = {v}")
+    if len(c) > 10:
+        lines.append(f"  … and {len(c) - 10} more")
+    lines.append("")
+
+    # Orphans (show top 10)
+    o = report["orphans"]
+    lines.append(f"Orphan memories (no edges) ({len(o)}):")
+    for item in o[:10]:
+        lines.append(f"  • #{item['id']} [{item['category']}] imp={item['importance']}: {item['preview']}")
+    if len(o) > 10:
+        lines.append(f"  … and {len(o) - 10} more")
+    lines.append("")
+
+    # Pending reviews
+    p = report["pending_reviews"]
+    lines.append(f"Pending reviews ({len(p)}):")
+    if p:
+        for item in p[:10]:
+            lines.append(f"  • #{item['id']} imp={item['importance']}: {item['preview']}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    # Low-confidence facts
+    lc = report["low_confidence_facts"]
+    lines.append(f"Low-confidence facts ({len(lc)}):")
+    if lc:
+        for item in lc[:10]:
+            lines.append(f"  • {item['key']} (conf={item['confidence']}): {item['value']}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    # High-importance unlinked
+    hu = report["unlinked_high_importance"]
+    lines.append(f"High-importance memories without edges ({len(hu)}):")
+    if hu:
+        for item in hu[:10]:
+            lines.append(f"  • #{item['id']} imp={item['importance']}: {item['preview']}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    # Inconsistencies
+    ic = report["inconsistencies"]
+    lines.append(f"Inconsistencies ({len(ic)}):")
+    if ic:
+        for item in ic[:10]:
+            lines.append(f"  • #{item['id']}: {item['issue']}")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append(report["summary"])
+
+    return "\n".join(lines)
+
+
+# ─── Tool: export_wiki — generate markdown wiki from memories ────────
+
+@mcp.tool()
+def export_wiki(
+    output_dir: str,
+    min_importance: int = 3,
+    max_pages: int = 500,
+) -> str:
+    """Export all memories as an interlinked markdown wiki (Obsidian-compatible).
+
+    Generates:
+      {output_dir}/index.md    — catalog by category with [[wikilinks]]
+      {output_dir}/pages/      — one .md file per memory with YAML frontmatter
+      {output_dir}/edges.md    — all graph connections as wikilinks
+      {output_dir}/log.md      — append-only export log
+
+    Each page includes YAML frontmatter (id, title, category, importance,
+    scope, created, tags, edges count) and [[wikilink]] references to
+    connected memories. Open the output directory in Obsidian for graph view.
+
+    Args:
+        output_dir: Directory to write the wiki into (will be created)
+        min_importance: Minimum importance (1-10) to include (default: 3)
+        max_pages: Maximum number of pages to export (default: 500)
+    """
+    conn = _get_conn()
+    result = _db_export_wiki(conn, WORKSPACE_ID, output_dir, min_importance, max_pages)
+
+    lines = [
+        f"=== Wiki Exported ===\n",
+        f"Output: {result['output_dir']}\n",
+        f"Pages: {result['page_count']} ({result['edge_count']} edges, {result['error_count']} errors)\n",
+        f"Files created:",
+    ]
+    for f in result["files"]:
+        lines.append(f"  • {f}")
+    lines.append(f"\nOpen {result['output_dir']}/index.md in Obsidian to start browsing.")
+
+    return "\n".join(lines)
 
 
 # ─── REST API layer for Craft Memory UI (browser-friendly endpoints) ──
