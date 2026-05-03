@@ -69,7 +69,58 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 
 ---
 
+## Knowledge Base Health & Wiki Export
+
+Craft Memory's knowledge base grows over time — memories accumulate, facts multiply, graph edges cross-connect everything. Three tools keep this healthy and accessible:
+
+### `lint_wiki()` — The Doctor
+
+Think of it as a **check-up for your knowledge base**. It looks for:
+
+- **Contradictions** — two facts that say different things about the same topic (e.g., `db_size = 0.47MB` vs `db_size = 1.04MB`). The LLM might pick the wrong one. `lint_wiki()` flags them so you can decide which is correct and invalidate the other.
+- **Orphans** — memories with zero graph edges. They exist but nothing connects to them. They might be important but disconnected — or just noise.
+- **Pending reviews** — memories flagged with `lifecycle_status = 'needs_review'` that haven't been approved yet.
+- **Low-confidence facts** — facts stored with `confidence < 0.5`. Worth checking if they're still accurate.
+- **High-importance unlinked** — memories with importance ≥ 8 but no edges. These are likely important discoveries that weren't auto-linked.
+- **Inconsistencies** — memories with invalid lifecycle states or broken references.
+
+**Run it:** `lint_wiki()` → returns a structured report. Review the findings, then use `invalidate_memory()` to fix contradictions, `flag_for_review()` to mark questionable items, or `find_similar(auto_link=True)` to connect orphans.
+
+**My recommendation:** Run `lint_wiki()` after every 50-100 new memories, or weekly via the SchedulerTick automation.
+
+### `export_wiki()` — The Obsidian Bridge
+
+This turns your **SQLite database into an Obsidian-compatible markdown wiki**. Every memory becomes a `.md` file with:
+
+- **YAML frontmatter** — `id`, `title`, `category`, `importance`, `scope`, `created`, `tags`, `edges` count. Obsidian's Dataview plugin can run SQL-like queries on this.
+- **[[Wikilinks]]** — each page links to its graph neighbors via `[[mem-42-title]]` syntax. Obsidian's graph view renders these as an interactive network.
+- **`index.md`** — catalog of all pages organized by category with links. The entry point.
+- **`edges.md`** — all 1500+ graph connections as readable wikilinks.
+- **`log.md`** — append-only export log (timestamps + page count).
+
+**Run it:** `export_wiki(output_dir="/path/to/wiki", min_importance=5)` → opens in Obsidian with graph view, plugin support, and markdown portability.
+
+**Why it matters for you:** Your agent sees the knowledge as SQLite rows. You see it as an interlinked wiki. Both views are valid — the wiki gives you human-scale observability (graph view, plugin queries, git versioning) that the database can't.
+
+### `source_url / source_title` — Provenance Tracking
+
+Every memory can now carry `source_url` and `source_title` — where the information came from. Use it when extracting knowledge from articles, papers, or web pages:
+
+```
+remember(
+  content="Claude Code uses a ToolDef interface + buildTool() factory",
+  source_url="https://docs.anthropic.com/claude-code",
+  source_title="Claude Code Architecture Docs"
+)
+```
+
+Later, `search_memory("source_url:anthropic.com")` finds all memories derived from that domain. Migration 013 adds the columns and index — zero breaking changes to existing memories.
+
+---
+
 ## How It Works
+
+
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -145,6 +196,9 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 | **Memory consolidation** | `consolidate_memories` combines low-value memories into a procedure in one call; `confirm=False` dry-run, `confirm=True` executes; all invalidations are soft (reversible) |
 | **Session quality scoring** | `rate_session` assigns a `quality_score` (0.0–1.0) to any session summary; feeds `get_high_quality_sessions` and `export_session_traces` |
 | **SessionDB** | `get_high_quality_sessions` and `export_session_traces` (JSONL) provide the data bridge for self-improvement loops, fine-tuning, and evaluation datasets (Hermes/GEPA pattern) |
+| **Wiki health check** | `lint_wiki()` scans the knowledge base for contradictions (same-key-prefix different values), orphan memories (no graph edges), pending reviews, low-confidence facts, high-importance unlinked memories, and lifecycle inconsistencies. Run periodically to keep the KB healthy |
+| **Obsidian wiki export** | `export_wiki(output_dir)` generates an interlinked markdown wiki from all memories — YAML frontmatter, [[wikilink]] neighbors, index.md by category, edges.md, log.md. Open the output dir in Obsidian for native graph view and Dataview queries |
+| **Source tracking** | `source_url` + `source_title` columns on memories (migration 013) allow tracing knowledge provenance. Use `remember(source_url="...")` when extracting info from articles, papers, or web pages |
 | **Prometheus metrics** | `GET /metrics` exposes memories, facts, open loops, procedures, avg confidence, db_size in Prometheus text format — Grafana-ready without MCP overhead |
 
 ---
@@ -166,6 +220,8 @@ Everything else — graph relationships, procedure tracking, multi-hop context, 
 | `summarize_scope(scope)` | Generate a full snapshot: memories + facts + loops + latest summary |
 | `save_summary(summary, decisions, facts_learned, open_loops, refs, next_steps)` | Save a structured session handoff document |
 | `run_maintenance()` | Cleanup old memories, trim summaries, dedup, VACUUM |
+| `lint_wiki()` | Knowledge base health check: contradictions, orphans, pending reviews, low-confidence facts, high-importance unlinked, lifecycle inconsistencies |
+| `export_wiki(output_dir, min_importance, max_pages)` | Export memories as Obsidian-compatible markdown wiki with YAML frontmatter, [[wikilinks]] to neighbors, index.md by category, edges.md, and log.md. Open in Obsidian for graph view |
 | `promote_to_core(id)` | Mark a memory as core (`is_core=1`) — immune to importance decay |
 | `link_memories(source_id, target_id, relation, confidence_type, confidence_score, role, weight)` | Create a directed edge; `role` classifies semantic type (core/context/detail/temporal/causal), `weight` sets traversal priority |
 | `get_relations(memory_id, direction)` | Get graph neighbors of a memory (`in`, `out`, or `both`) |
