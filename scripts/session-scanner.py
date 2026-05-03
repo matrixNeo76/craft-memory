@@ -272,6 +272,7 @@ def save_classified_messages(
     messages: list[dict],
     dry_run: bool,
     verbose: bool,
+    project_name: str = "default",
 ) -> dict:
     """Classify and save messages to craft-memory.
 
@@ -316,7 +317,7 @@ def save_classified_messages(
                 category = "discovery"
 
         # Build tags
-        tags = ["session:scanned", f"session:{session_id}"]
+        tags = ["session:scanned", f"session:{session_id}", f"project:{project_name}"]
         if category:
             tags.append(f"category:{category}")
 
@@ -462,8 +463,10 @@ def scan_sessions(workspace_path: str, dry_run: bool = False,
             print(f"  SCAN {session_id}: {name} ({len(messages)} user msgs, {msg_count} total, {cost_f})")
 
         # Classify and save
+        # Derive project name from workspace path
+        project_name = os.path.basename(os.path.normpath(workspace_path))
         session_results = save_classified_messages(
-            session_id, messages, dry_run, verbose,
+            session_id, messages, dry_run, verbose, project_name=project_name,
         )
 
         report["scanned"].append({
