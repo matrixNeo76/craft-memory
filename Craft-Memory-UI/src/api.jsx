@@ -104,6 +104,8 @@
     diff:            (since)         => get("/api/diff", { since }),
     relations:       (id, dir)       => get("/api/relations", { memory_id: id, direction: dir }),
     handoff:         (scope)         => get("/api/handoff", { scope }),
+    lint:            ()              => get("/api/lint"),
+    exportWiki:      (body)          => post("/api/export-wiki", body),
     remember:        (body)          => post("/api/memories", body),
     addLoop:         (body)          => post("/api/loops", body).then(normLoop),
     closeLoop:       (id, resolution) => post(`/api/loops/${id}/close`, { resolution: resolution || "" }),

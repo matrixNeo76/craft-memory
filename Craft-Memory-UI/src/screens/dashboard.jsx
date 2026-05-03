@@ -3,6 +3,35 @@ const DashboardScreen = ({ onNavigate, action }) => {
   const { STATS, MEMORIES, FACTS, formatRelTime, CATEGORIES } = window.CRAFT;
   const [diffEvents, setDiffEvents] = React.useState(window.CRAFT.DIFF_EVENTS || []);
   const [maintenanceMsg, setMaintenanceMsg] = React.useState(null);
+
+  // ─── Wiki health check (lint) state ──────────────────────────────────
+  const [lintResult, setLintResult] = React.useState(null);
+  const [linting, setLinting] = React.useState(false);
+  const [lintError, setLintError] = React.useState(null);
+  const runLint = () => {
+    setLinting(true); setLintError(null);
+    CRAFT_API.lint()
+      .then((r) => setLintResult(r))
+      .catch((e) => { setLintError(e.message); setLintResult(null); })
+      .finally(() => setLinting(false));
+  };
+
+  // ─── Wiki export state ──────────────────────────────────────────────
+  const exportPathRef = React.useRef(null);
+  const [exportPath, setExportPath] = React.useState("./wiki");
+  const [exportMinImp, setExportMinImp] = React.useState(5);
+  const [exportResult, setExportResult] = React.useState(null);
+  const [exporting, setExporting] = React.useState(false);
+  const [exportError, setExportError] = React.useState(null);
+  const runExport = () => {
+    const path = exportPathRef.current?.value || exportPath;
+    setExportPath(path); setExporting(true); setExportError(null); setExportResult(null);
+    CRAFT_API.exportWiki({ output_dir: path, min_importance: exportMinImp })
+      .then((r) => setExportResult(r))
+      .catch((e) => setExportError(e.message))
+      .finally(() => setExporting(false));
+  };
+
   const recent = MEMORIES.slice(0, 5);
   const godFacts = [...FACTS].sort((a, b) => b.godScore - a.godScore).slice(0, 6);
 
@@ -212,6 +241,89 @@ const DashboardScreen = ({ onNavigate, action }) => {
         </div>
       </div>
 
+      <div className="dash-row-2">
+        <div className="panel">
+          <div className="panel-head">
+            <div className="panel-title"><Icon name="search" /> Wiki health check <span className="dim">/* lint_wiki() */</span></div>
+            <button className="btn ghost" onClick={runLint} disabled={linting}>
+              {linting ? "Scanning…" : "Run check"}
+            </button>
+          </div>
+          <div className="panel-body" style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-1)", maxHeight: 300, overflowY: "auto" }}>
+            {lintResult === null && !linting && <div style={{ padding: 8, color: "var(--ink-3)" }}>Press "Run check" to scan the knowledge base for contradictions, orphans, pending reviews, low-confidence facts, and inconsistencies.</div>}
+            {linting && <div style={{ padding: 8, color: "var(--ink-3)" }}>Scanning {STATS.memoriesTotal} memories and {STATS.factsTotal} facts…</div>}
+            {lintResult && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div className="stat-grid" style={{ gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+                  <FindingsCard label="Contradictions" count={lintResult.contradictions.length} color={lintResult.contradictions.length > 0 ? "var(--critical)" : "oklch(0.78 0.18 150)"} />
+                  <FindingsCard label="Orphans" count={lintResult.orphans.length} color={lintResult.orphans.length > 0 ? "var(--accent)" : "oklch(0.78 0.18 150)"} />
+                  <FindingsCard label="Pending review" count={lintResult.pending_reviews.length} color={lintResult.pending_reviews.length > 0 ? "var(--critical)" : "oklch(0.78 0.18 150)"} />
+                </div>
+                <div className="stat-grid" style={{ gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+                  <FindingsCard label="Low conf facts" count={lintResult.low_confidence_facts.length} />
+                  <FindingsCard label="High imp unlinked" count={lintResult.unlinked_high_importance.length} color={lintResult.unlinked_high_importance.length > 0 ? "var(--accent)" : "oklch(0.78 0.18 150)"} />
+                  <FindingsCard label="Inconsistencies" count={lintResult.inconsistencies.length} color={lintResult.inconsistencies.length > 0 ? "var(--critical)" : "oklch(0.78 0.18 150)"} />
+                </div>
+                {lintResult.contradictions.length > 0 && (
+                  <div>
+                    <div style={{ color: "var(--critical)", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 4 }}>Contradictions</div>
+                    {lintResult.contradictions.slice(0, 5).map((c, i) => (
+                      <div key={i} style={{ padding: "4px 0", borderBottom: "1px solid var(--line)", fontSize: 10, lineHeight: 1.4 }}>
+                        <span style={{ color: "var(--ink-2)" }}>{c.prefix}:</span> {c.values.join(" vs ")}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {lintResult.orphans.length > 0 && (
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 12, color: "var(--ink-2)" }}>
+                    {lintResult.orphans.length} memories have no graph edges — use <span style={{ fontFamily: "var(--font-mono)", color: "var(--accent)" }}>find_similar(auto_link=True)</span> to connect them.
+                  </div>
+                )}
+                <div style={{ color: "var(--ink-3)", fontSize: 10, borderTop: "1px solid var(--line)", paddingTop: 6 }}>
+                  {lintResult.summary}
+                </div>
+              </div>
+            )}
+            {lintError && <div style={{ color: "var(--critical)", padding: 8, fontFamily: "var(--font-mono)", fontSize: 10 }}>Error: {lintError}</div>}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-head">
+            <div className="panel-title"><Icon name="export" /> Export wiki <span className="dim">/* export_wiki() */</span></div>
+          </div>
+          <div className="panel-body" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)" }}>
+              Generate an Obsidian-compatible markdown wiki from all memories. Each memory becomes a .md file with YAML frontmatter and [[wikilink]] neighbors.
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input ref={exportPathRef}
+                defaultValue={exportPath}
+                style={{ flex: 1, background: "var(--bg-1)", border: "1px solid var(--line-2)", borderRadius: "var(--radius-sm)", padding: "7px 10px", color: "var(--ink-0)", fontFamily: "var(--font-mono)", fontSize: 11, outline: "none" }}
+                placeholder="/path/to/wiki"
+              />
+              <button className="btn primary" onClick={runExport} disabled={exporting}>
+                {exporting ? "Exporting…" : "Export"}
+              </button>
+            </div>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)" }}>
+              Min importance: {exportMinImp}
+              <input type="range" min="1" max="10" value={exportMinImp}
+                onChange={(e) => setExportMinImp(Number(e.target.value))}
+                style={{ marginLeft: 6, verticalAlign: "middle", width: 60 }} />
+            </div>
+            {exportResult && (
+              <div style={{ background: "var(--bg-1)", borderRadius: "var(--radius-sm)", padding: 10, fontFamily: "var(--font-mono)", fontSize: 10, lineHeight: 1.5 }}>
+                <div style={{ color: "oklch(0.78 0.18 150)" }}>✓ {exportResult.page_count} pages · {exportResult.edge_count} edges</div>
+                <div style={{ color: "var(--ink-2)" }}>Output: {exportResult.output_dir}</div>
+                <div style={{ color: "var(--ink-3)", marginTop: 4 }}>Files: {exportResult.files.join(", ")}</div>
+              </div>
+            )}
+            {exportError && <div style={{ color: "var(--critical)", fontFamily: "var(--font-mono)", fontSize: 10 }}>Error: {exportError}</div>}
+          </div>
+        </div>
+      </div>
+
       <div className="panel">
         <div className="panel-head">
           <div className="panel-title">Memory diff <span className="dim">/ since 4h ago · live stream</span></div>
@@ -349,5 +461,13 @@ const HeatmapView = () => {
     </div>
   );
 };
+
+// ─── Mini findings card for lint report ────────────────────────────────
+const FindingsCard = ({ label, count, color }) => (
+  <div style={{ padding: "8px 10px", background: "var(--bg-2)", borderRadius: "var(--radius-sm)", display: "flex", flexDirection: "column", gap: 2 }}>
+    <span style={{ fontFamily: "var(--font-mono)", fontSize: 16, fontWeight: 500, color: color || "var(--ink-0)" }}>{count}</span>
+    <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</span>
+  </div>
+);
 
 window.DashboardScreen = DashboardScreen;

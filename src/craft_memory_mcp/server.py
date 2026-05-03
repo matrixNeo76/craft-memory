@@ -1914,6 +1914,30 @@ async def api_handoff(request):
     return JSONResponse(pack)
 
 
+@mcp.custom_route("/api/lint", methods=["GET"])
+async def api_lint(request):
+    """Run knowledge base health check. Returns structured report."""
+    from starlette.responses import JSONResponse
+    ws = _resolve_ws(request.query_params.get("workspace_id"))
+    conn = _get_conn()
+    report = _db_lint_wiki(conn, ws)
+    return JSONResponse(report)
+
+
+@mcp.custom_route("/api/export-wiki", methods=["POST"])
+async def api_export_wiki(request):
+    """Export memories as Obsidian-compatible markdown wiki."""
+    from starlette.responses import JSONResponse
+    body = await request.json()
+    ws = _resolve_ws(body.get("workspace_id"))
+    output_dir = body.get("output_dir", "/tmp/craft-memory-wiki")
+    min_importance = int(body.get("min_importance", 3))
+    max_pages = int(body.get("max_pages", 500))
+    conn = _get_conn()
+    result = _db_export_wiki(conn, ws, output_dir, min_importance, max_pages)
+    return JSONResponse(result)
+
+
 def run_server():
     """Start the MCP server with the configured transport."""
     if MCP_TRANSPORT == "http":
