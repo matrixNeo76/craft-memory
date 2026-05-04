@@ -22,14 +22,11 @@ import json
 import os
 import re as _re
 import sys
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any
 
-try:
-    _VERSION = _pkg_version("craft-memory-mcp")
-except PackageNotFoundError:
-    _VERSION = "dev"
+from craft_memory_mcp import __version__ as _VERSION
 
 _PRIVATE_PATTERNS = _re.compile(
     r"<(private|system-reminder|system-instruction|system)>.*?</\1>",
@@ -115,10 +112,24 @@ from craft_memory_mcp.db import (
     get_top_procedures as _db_get_top_procedures,
     consolidate_memories as _db_consolidate_memories,
     rate_session as _db_rate_session,
+    spec_to_plan as _db_spec_to_plan,
+    plan_to_tasks_text as _db_plan_to_tasks_text,
     get_high_quality_sessions as _db_get_high_quality_sessions,
     export_session_traces as _db_export_session_traces,
     export_wiki as _db_export_wiki,
+    shortest_path as _db_shortest_path,
+    query_graph as _db_query_graph,
+    get_memories_for_graph as _db_get_memories_for_graph,
+    get_all_relations as _db_get_all_relations,
+    export_graphml as _db_export_graphml,
+    export_cypher as _db_export_cypher,
+    record_procedure_outcome as _db_record_outcome,
+    update_procedure_confidence as _db_update_conf,
 )
+
+from craft_memory_mcp.clustering import detect_communities as _cluster, get_community_stats as _cluster_stats
+from craft_memory_mcp.graph_viz import generate_graph_html as _graph_viz
+
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
 
@@ -198,6 +209,38 @@ async def health_check(request):
     })
 
 
+@mcp.custom_route("/health/liveness", methods=["GET"])
+async def health_liveness(request):
+    """Liveness probe — always 200 if the server process is alive."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "alive", "service": "craft-memory", "version": _VERSION})
+
+
+@mcp.custom_route("/health/readiness", methods=["GET"])
+async def health_readiness(request):
+    """Readiness probe — 200 when DB is connected and migrations have run."""
+    from starlette.responses import JSONResponse
+    try:
+        conn = _get_conn()
+        conn.execute("SELECT 1")
+        # Check migrations ran
+        version = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()
+        db_status = "ready"
+        msg = f"migrations at v{version[0] if version else 0}"
+    except Exception as e:
+        db_status = "not_ready"
+        msg = str(e)
+
+    status_code = 200 if db_status == "ready" else 503
+    return JSONResponse({
+        "status": db_status,
+        "service": "craft-memory",
+        "version": _VERSION,
+        "message": msg,
+        "workspace": WORKSPACE_ID,
+    }, status_code=status_code)
+
+
 # ─── Prometheus-compatible metrics endpoint (HTTP transport only) ─────
 
 @mcp.custom_route("/metrics", methods=["GET"])
@@ -248,8 +291,81 @@ async def metrics(request):
     return PlainTextResponse("\n\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
-# Global connection (one per server instance)
+# ─── Rate limiter ────────────────────────────────────────────────────
+# Prevents rapid-fire tool calls (max RATE_LIMIT calls per second)
+from collections import deque
+import time as _time
+
+_RATE_LIMIT = 30  # max calls per second
+_call_timestamps: deque = deque(maxlen=_RATE_LIMIT)
+
+
+def _check_rate_limit() -> str | None:
+    """Check rate limit. Returns error message if exceeded, None if OK."""
+    now = _time.time()
+    _call_timestamps.append(now)
+    if len(_call_timestamps) >= _RATE_LIMIT:
+        oldest = _call_timestamps[0]
+        if now - oldest < 1.0:
+            return f"Rate limit exceeded: max {_RATE_LIMIT} calls per second. Wait and retry."
+    return None
+
+
+# ─── Graph cache ─────────────────────────────────────────────────────
+_graph_cache: dict = {}
+_GRAPH_CACHE_TTL = 5.0
+
+
+def _get_cached_graph(key: str, fetcher):
+    """Simple TTL cache for graph data. Invalidated on link_memories()."""
+    now = _time.time()
+    cached = _graph_cache.get(key)
+    if cached and now - cached[0] < _GRAPH_CACHE_TTL:
+        return cached[1]
+    result = fetcher()
+    _graph_cache[key] = (now, result)
+    return result
+
+
+def _invalidate_graph_cache():
+    _graph_cache.clear()
+
+
+# ─── Thread safety ────────────────────────────────────────────────
+import threading as _threading
+
+_conn_lock = _threading.Lock()
 _conn = None
+
+_write_count = 0
+_CHECKPOINT_EVERY = 50
+
+
+def _maybe_checkpoint(conn) -> None:
+    global _write_count
+    with _conn_lock:
+        _write_count += 1
+        if _write_count >= _CHECKPOINT_EVERY:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            _write_count = 0
+
+
+def _get_conn():
+    global _conn
+    with _conn_lock:
+        if _conn is not None:
+            try:
+                _conn.execute("SELECT 1")
+            except Exception:
+                _conn = None
+        if _conn is None:
+            _conn = _db_get_connection(WORKSPACE_ID)
+            _db_register_session(_conn, CRAFT_SESSION_ID, WORKSPACE_ID)
+        return _conn
+
 
 # WAL checkpoint counter — flush WAL every N writes to keep file size bounded
 _write_count = 0
@@ -297,6 +413,8 @@ def remember(
     importance: int = 5,
     source_session: str | None = None,
     tags: list[str] | None = None,
+    force: bool = False,
+    compress_level: int = 0,
 ) -> str:
     """Store a new episodic memory (decision, discovery, bugfix, feature, refactor, change, note).
 
@@ -307,21 +425,44 @@ def remember(
         importance: Priority 1-10 (default: 5)
         source_session: Session ID that created this memory
         tags: Optional list of tags e.g. ["auth", "deploy"]
+        force: If True, bypasses dedup and stores even if duplicate content_hash
+        compress_level: 0=no compression, 1=dictionary compression (~40% saving)
 
     Returns:
         Confirmation with memory ID or duplicate notice
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
     session_id = source_session or CRAFT_SESSION_ID
     content = _strip_private(content)
     if not content:
         return "Memory skipped: content was empty after stripping private tags."
+
+    # Input validation
+    valid_categories = {'decision', 'discovery', 'bugfix', 'feature', 'refactor', 'change', 'note'}
+    if category not in valid_categories:
+        return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(valid_categories))}"
+    if not isinstance(importance, int) or importance < 1 or importance > 10:
+        return f"Importance must be 1-10, got {importance}"
+    if not isinstance(compress_level, int) or compress_level < 0 or compress_level > 2:
+        return f"compress_level must be 0, 1 or 2, got {compress_level}"
+    if tags is not None:
+        if not isinstance(tags, list):
+            return "Tags must be a list of strings"
+        for t in tags:
+            if not isinstance(t, str):
+                return f"Each tag must be a string, got {type(t).__name__}"
+
     mem_id = _db_remember(
         conn, session_id, WORKSPACE_ID, content,
         category, importance, scope, session_id, tags,
+        force=force, compress_level=compress_level,
     )
     if mem_id is None:
         return "Duplicate memory skipped (same content already stored in this workspace)"
+    _invalidate_graph_cache()
     tag_str = f" tags={tags}" if tags else ""
     _maybe_checkpoint(conn)
     return f"Memory #{mem_id} stored: [{category}] (importance={importance}){tag_str}"
@@ -335,6 +476,7 @@ def search_memory(
     scope: str | None = None,
     limit: int = 20,
     use_rrf: bool = True,
+    decompress: bool = True,
 ) -> str:
     """Search memories using full-text search with RRF hybrid ranking.
 
@@ -343,15 +485,19 @@ def search_memory(
         scope: Filter by scope (default: all)
         limit: Max results (default: 20)
         use_rrf: Use RRF hybrid ranking (BM25 + word-overlap fusion). Default True.
+        decompress: Decompress content stored with compress_level>0 (default: True)
 
     Returns:
         List of matching memories
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
     if use_rrf:
-        results = _db_hybrid_search(conn, query, WORKSPACE_ID, scope=scope, limit=limit)
+        results = _db_hybrid_search(conn, query, WORKSPACE_ID, scope=scope, limit=limit, decompress=decompress)
     else:
-        results = _db_search_memory(conn, query, WORKSPACE_ID, scope, limit)
+        results = _db_search_memory(conn, query, WORKSPACE_ID, scope, limit, decompress=decompress)
     if not results:
         return "No memories found matching your query."
 
@@ -372,6 +518,7 @@ def get_recent_memory(
     scope: str | None = None,
     limit: int = 10,
     max_tokens: int | None = None,
+    decompress: bool = True,
 ) -> str:
     """Get most recent memories, ranked by importance with time decay. Use at session start.
 
@@ -379,12 +526,16 @@ def get_recent_memory(
         scope: Filter by scope (default: all)
         limit: Max results (default: 10)
         max_tokens: Token budget limit — stops adding memories when exceeded (optional)
+        decompress: Decompress content stored with compress_level>0 (default: True)
 
     Returns:
         List of recent memories
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
-    results = _db_get_recent_memory(conn, WORKSPACE_ID, scope, limit, max_tokens)
+    results = _db_get_recent_memory(conn, WORKSPACE_ID, scope, limit, max_tokens, decompress=decompress)
     if not results:
         return "No memories found for this workspace."
 
@@ -808,6 +959,7 @@ def link_memories(
     )
     if rel_id is None:
         return f"Relation already exists or invalid: #{source_id} --{relation}--> #{target_id}"
+    _invalidate_graph_cache()
     _maybe_checkpoint(conn)
     return f"Relation #{rel_id} created: #{source_id} --[{role}:{relation} w={weight}]--> #{target_id}"
 
@@ -981,19 +1133,22 @@ def memory_diff(
 @mcp.tool()
 def memory_stats(
     scope: str | None = None,
+    source_filter: str | None = None,
 ) -> str:
     """[admin] Aggregate stats for this workspace.
 
     Args:
         scope: Filter by scope (default: all scopes)
+        source_filter: 'automation' | 'manual' | None (default: None = all)
 
     Returns:
         Summary of workspace memory state
     """
     conn = _get_conn()
-    stats = _db_get_memory_stats(conn, WORKSPACE_ID, scope=scope)
+    stats = _db_get_memory_stats(conn, WORKSPACE_ID, scope=scope, source_filter=source_filter)
+    filter_label = f" source={source_filter}" if source_filter else ""
     lines = [
-        f"Workspace stats (scope={scope or 'all'}):",
+        f"Workspace stats (scope={scope or 'all'}{filter_label}):",
         f"  Memories: {stats['total_memories']} total ({stats['core_memories']} core, avg importance {stats['avg_importance']})",
         f"  Categories: {stats['by_category']}",
         f"  Open loops: {stats['open_loops']}",
@@ -1248,6 +1403,10 @@ def save_procedure(
     confidence: float = 0.5,
     source_memory_ids: str = "",
     status: str = "active",
+    mode: str = "manual",
+    verify_command: str | None = None,
+    acceptance_criteria: str | None = None,
+    spec_text: str | None = None,
 ) -> str:
     """Save or update a reusable procedure (step-by-step pattern).
 
@@ -1261,6 +1420,10 @@ def save_procedure(
         confidence: How reliable is this procedure (0.0–1.0, default 0.5)
         source_memory_ids: Comma-separated memory IDs that inspired this procedure (optional)
         status: 'active' | 'draft' | 'deprecated'
+        mode: 'manual' (default) | 'cavekit' (spec-driven with verify)
+        verify_command: Shell command to verify the procedure succeeded (cavekit mode)
+        acceptance_criteria: Criteria that define success (cavekit mode)
+        spec_text: Original spec that generated this procedure (cavekit mode)
     """
     conn = _get_conn()
     src_ids = None
@@ -1272,9 +1435,94 @@ def save_procedure(
     pid = _db_save_procedure(
         conn, WORKSPACE_ID, name, trigger_context, steps_md,
         confidence=confidence, source_memory_ids=src_ids, status=status,
+        mode=mode, verify_command=verify_command,
+        acceptance_criteria=acceptance_criteria, spec_text=spec_text,
     )
     _maybe_checkpoint(conn)
-    return f'Procedure #{pid} "{name}" saved (confidence={confidence}, status={status}).'
+    parts = [f'Procedure #{pid} "{name}" saved']
+    if mode == "cavekit":
+        parts.append("(cavekit mode)")
+    parts.append(f'(confidence={confidence}, status={status})')
+    return " ".join(parts)
+
+
+@mcp.tool()
+def spec_to_plan(
+    spec_text: str,
+    name: str | None = None,
+) -> str:
+    """[cavekit] Converte una specifica testuale in un piano strutturato con task.
+
+    Analizza la specifica riga per riga, estraendo task numerati
+    e comandi di verifica [verify: ...] per ogni task.
+
+    Args:
+        spec_text: Il testo della specifica
+            Formato consigliato:
+              1. Task description [verify: command]
+              2. Another task [criteria: acceptance criteria]
+              * Bullet task
+        name: Nome opzionale del piano (default: prima riga della spec)
+
+    Returns:
+        Piano strutturato con task, criteri di accettazione, comandi verify
+    """
+    plan = _db_spec_to_plan(spec_text, name=name)
+    return _db_plan_to_tasks_text(plan)
+
+
+@mcp.tool()
+def record_procedure_outcome_and_advance(
+    procedure_id: int,
+    outcome: str,
+    notes: str | None = None,
+    next_task_id: int | None = None,
+) -> str:
+    """[cavekit] Registra l'esito di un task e passa al successivo.
+
+    Da usare durante l'esecuzione di un piano Cavekit:
+    1. Esegui un task
+    2. Chiama questa funzione con l'esito
+    3. Prendi il task successivo dal piano
+
+    Args:
+        procedure_id: ID della procedura (piano)
+        outcome: 'success' | 'partial' | 'failure'
+        notes: Note sull'esecuzione
+        next_task_id: ID del prossimo task da eseguire (opzionale)
+
+    Returns:
+        Messaggio con l'esito e il task successivo
+    """
+    conn = _get_conn()
+
+    # Recupera la procedura
+    proc = conn.execute(
+        "SELECT * FROM procedures WHERE id = ? AND workspace_id = ?",
+        (procedure_id, WORKSPACE_ID),
+    ).fetchone()
+
+    if not proc:
+        return f"Procedure #{procedure_id} not found."
+
+    # Registra outcome
+    outcome_id = _db_record_outcome(conn, procedure_id, WORKSPACE_ID, outcome, notes)
+    _maybe_checkpoint(conn)
+
+    # Aggiorna confidence
+    new_conf = _db_update_conf(conn, procedure_id, WORKSPACE_ID)
+
+    lines = [
+        f"Outcome #{outcome_id} recorded: {outcome}",
+    ]
+    if new_conf is not None:
+        lines.append(f"Updated confidence: {new_conf:.3f}")
+    if next_task_id:
+        lines.append(f"Next task to execute: #{next_task_id}")
+    if notes:
+        lines.append(f"Notes: {notes}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1739,6 +1987,237 @@ def export_wiki(
     return "\n".join(lines)
 
 
+# ─── Sprint 10: Query Tools ────────────────────────────────────────────
+
+
+@mcp.tool()
+def shortest_path(
+    source_id: int,
+    target_id: int,
+    max_depth: int = 10,
+) -> str:
+    """[graph] Trova il percorso più breve tra due memorie nel grafo.
+
+    Args:
+        source_id: Memory ID di partenza
+        target_id: Memory ID di destinazione
+        max_depth: Profondità massima BFS (default: 10)
+
+    Returns:
+        Percorso come lista di edge, o messaggio "non raggiungibile"
+    """
+    conn = _get_conn()
+    path = _db_shortest_path(conn, source_id, target_id, WORKSPACE_ID, max_depth)
+    if path is None:
+        return f"Nessun percorso trovato da #{source_id} a #{target_id} (max_depth={max_depth})"
+    if path == []:
+        return f"Source #{source_id} e target #{target_id} sono lo stesso nodo."
+
+    lines = [f"Percorso da #{source_id} a #{target_id} ({len(path)} hop):\n"]
+    for i, e in enumerate(path):
+        arrow = f"  {i+1}. #{e['source_id']} --[{e['relation']}]--> #{e['target_id']}"
+        lines.append(arrow)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def subgraph(
+    memory_id: int,
+    depth: int = 2,
+) -> str:
+    """[graph] Estrae il contesto locale di una memoria (subgraph BFS).
+
+    Args:
+        memory_id: Memory ID centrale
+        depth: Profondità BFS (default: 2, massimo: 4)
+
+    Returns:
+        Nodi e archi del subgrafo
+    """
+    conn = _get_conn()
+    depth = min(depth, 4)
+    ctx = _db_get_graph_context(conn, memory_id, WORKSPACE_ID, depth=depth)
+    if ctx is None:
+        return f"Memory #{memory_id} not found."
+
+    lines = [
+        f"Subgraph centered on #{memory_id} (depth={depth}):",
+        f"  Nodes: {ctx['total_nodes']}",
+        f"  Edges: {ctx['total_edges']}\n",
+    ]
+    for n in ctx['nodes'][:15]:
+        lines.append(f"  #{n['id']} [{n['category']}] {n['content'][:80]}")
+    if ctx['total_nodes'] > 15:
+        lines.append(f"  ... and {ctx['total_nodes'] - 15} more nodes")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def query_graph(
+    tag: str | None = None,
+    category: str | None = None,
+    min_importance: int = 1,
+    limit: int = 20,
+) -> str:
+    """[graph] Query strutturata: filtra nodi per tag/categoria/importanza + mostra loro edge.
+
+    Args:
+        tag: Filtra per tag (es. 'code:python')
+        category: Filtra per categoria (decision, discovery, bugfix, feature, refactor, change, note)
+        min_importance: Importanza minima (1-10, default: 1)
+        limit: Max risultati (default: 20)
+
+    Returns:
+        Nodi filtrati con le loro relazioni
+    """
+    conn = _get_conn()
+    result = _db_query_graph(conn, WORKSPACE_ID, tag=tag, category=category,
+                             min_importance=min_importance, limit=limit)
+
+    lines = [
+        f"Graph query result: {result['count']} nodes, {len(result['edges'])} edges\n",
+    ]
+    for n in result['nodes']:
+        lines.append(f"  #{n['id']} [{n['category']}] importance={n['importance']}")
+        lines.append(f"    {n['content'][:120]}")
+
+    if result['edges']:
+        lines.append(f"\nEdges ({len(result['edges'])}):")
+        for e in result['edges'][:20]:
+            lines.append(f"  #{e['source_id']} --[{e['relation']}]--> #{e['target_id']}")
+
+    return "\n".join(lines)
+
+
+# ─── Sprint 10: Graph Visualization + Export Tools ────────────────────
+
+
+@mcp.tool()
+def get_communities(
+    resolution: float = 1.0,
+    limit: int = 500,
+) -> str:
+    """[graph] Rileva comunità semantiche nel grafo usando Leiden clustering.
+
+    Args:
+        resolution: Risoluzione clustering (>1=più comunità, <1=meno, default: 1.0)
+        limit: Max nodi da considerare (default: 500)
+
+    Returns:
+        Comunità rivelate con dimensione e membri principali.
+    """
+    conn = _get_conn()
+    memories = _db_get_memories_for_graph(conn, WORKSPACE_ID, limit=limit)
+    edges = _db_get_all_relations(conn, WORKSPACE_ID)
+
+    partition = _cluster(memories, edges, resolution=resolution)
+    if not partition:
+        return "Nessuna comunità rilevata. Il grafo potrebbe essere vuoto."
+
+    stats = _cluster_stats(partition)
+    lines = [f"Community detection (resolution={resolution}):\n"]
+    lines.append(f"  Total communities: {len(stats)}")
+    lines.append(f"  Clustered nodes: {len(partition)}\n")
+
+    for s in stats[:15]:
+        members = s["member_ids"][:5]
+        member_str = ", ".join(f"#{m}" for m in members)
+        if len(s["member_ids"]) > 5:
+            member_str += f"... (+{len(s['member_ids']) - 5} more)"
+        lines.append(f"  Community #{s['community_id']}: {s['size']} nodes [{member_str}]")
+
+    if len(stats) > 15:
+        lines.append(f"  ... and {len(stats) - 15} more communities")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def export_graph_html(
+    output_path: str,
+    resolution: float = 1.0,
+    limit: int = 500,
+) -> str:
+    """[graph] Genera grafo HTML interattivo con D3.js.
+
+    I nodi sono colorati per community (Leiden) e dimensionati per importance.
+    Include ricerca, filtri per confidence/categoria, legenda.
+
+    Args:
+        output_path: Percorso del file HTML da generare
+        resolution: Risoluzione clustering (default: 1.0)
+        limit: Max nodi (default: 500)
+
+    Returns:
+        Conferma con percorso del file generato
+    """
+    import os
+    from pathlib import Path
+
+    conn = _get_conn()
+    memories = _db_get_memories_for_graph(conn, WORKSPACE_ID, limit=limit)
+    edges = _db_get_all_relations(conn, WORKSPACE_ID)
+    partition = _cluster(memories, edges, resolution=resolution)
+
+    html = _graph_viz(memories, edges, partition=partition, title=f"Memory Graph - {WORKSPACE_ID}")
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+
+    size_kb = os.path.getsize(out) // 1024
+    return f"Graph HTML saved: {out.resolve()} ({size_kb} KB, {len(memories)} nodes, {len(edges)} edges)"
+
+
+@mcp.tool()
+def export_graphml(
+    output_path: str,
+) -> str:
+    """[graph] Esporta il grafo in formato GraphML (compatibile con Gephi, yEd).
+
+    Args:
+        output_path: Percorso del file .graphml da generare
+
+    Returns:
+        Conferma con percorso del file
+    """
+    from pathlib import Path
+
+    conn = _get_conn()
+    xml = _db_export_graphml(conn, WORKSPACE_ID)
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(xml, encoding="utf-8")
+
+    return f"GraphML saved: {out.resolve()}"
+
+
+@mcp.tool()
+def export_cypher(
+    output_path: str,
+) -> str:
+    """[graph] Esporta il grafo come query Cypher (compatibile con Neo4j).
+
+    Args:
+        output_path: Percorso del file .cypher da generare
+
+    Returns:
+        Conferma con percorso del file
+    """
+    from pathlib import Path
+
+    conn = _get_conn()
+    cypher = _db_export_cypher(conn, WORKSPACE_ID)
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(cypher, encoding="utf-8")
+
+    return f"Cypher saved: {out.resolve()}"
+
+
 # ─── REST API layer for Craft Memory UI (browser-friendly endpoints) ──
 
 def _resolve_ws(raw: str | None) -> str:
@@ -1957,6 +2436,16 @@ def run_server():
         )
         from pathlib import Path
         from starlette.staticfiles import StaticFiles
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        @app.middleware("http")
+        async def add_security_headers(request, call_next):
+            response = await call_next(request)
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return response
 
         class NoCacheStaticFiles(StaticFiles):
             """StaticFiles that adds no-cache headers at ASGI level (no buffering)."""

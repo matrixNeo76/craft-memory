@@ -1,7 +1,7 @@
 # Craft Memory System — Complete Architectural Documentation
 
 > **Date**: 2026-04-30
-> **Version**: 7.0 (Sprint 1–10 — 46 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy, graph context, batch ops, procedure intelligence, session quality, SessionDB)
+> **Version**: 8.0 (Sprint 1–10 + Phase 1–6 — 57 tools: compression, graph queries, community detection, HTML export, Cavekit workflow, code analyzer)
 > **Environment**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
@@ -156,9 +156,9 @@ _PRIVATE_PATTERNS = _re.compile(
 |------|---------|-----|--------|
 | `remember` | Save episodic memory (with privacy stripping and tags) | Write | baseline |
 | `update_memory` | Update content/category/importance of an existing memory | Write | baseline |
-| `search_memory` | RRF hybrid search: BM25 FTS5 + Jaccard word-overlap; LIKE fallback; lifecycle filter | Read | baseline |
+| `search_memory` | RRF hybrid search: BM25 FTS5 + Jaccard word-overlap; LIKE fallback; lifecycle filter; **source_filter** for origin-based filtering | Read | baseline |
 | `search_by_tag` | Filter memories by tag | Read | baseline |
-| `get_recent_memory` | Memories ranked by importance decay; supports token budget; lifecycle filter | Read | baseline |
+| `get_recent_memory` | Memories ranked by importance decay; supports token budget; lifecycle filter; **source_filter** for origin-based filtering | Read | baseline |
 | `upsert_fact` | Save/update stable fact with confidence score and `confidence_type` | Write | baseline |
 | `list_open_loops` | List open loops ordered by priority | Read | baseline |
 | `add_open_loop` | Create new cross-session loop | Write | baseline |
@@ -173,7 +173,7 @@ _PRIVATE_PATTERNS = _re.compile(
 | `find_similar` | FTS5 BM25 similarity search; `auto_link=True` creates INFERRED edges | Read | baseline |
 | `god_facts` | Top N facts by impact: `confidence × type_bonus × (1 + mention_count × 0.2)` | Read | baseline |
 | `memory_diff` | Delta since epoch timestamp: new memories, updated facts, opened/closed loops | Read | baseline |
-| `memory_stats` | Aggregate stats: memory count by scope/category, is_core count, open loops, facts, procedures | Read | Sprint 1 |
+| `memory_stats` | Aggregate stats: memory count by scope/category, is_core count, open loops, facts, procedures; **source_filter** for origin stats | Read | Phase 7 |
 | `explain_retrieval` | Explain why a memory would be retrieved: score, decay, is_core, tags | Read | Sprint 1 |
 | `generate_handoff` | Auto-generate structured handoff from recent memories, open loops, and facts | Read | Sprint 1 |
 | `save_decision_record` | Save a tagged memory with decision metadata (options, rationale, outcome) | Write | Sprint 1 |

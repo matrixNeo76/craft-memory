@@ -7,7 +7,9 @@ Environment variables:
 """
 
 import hashlib
+import html
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +17,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+from craft_memory_mcp.compress import compress as _compress, decompress as _decompress
 
 
 def _now_iso() -> str:
@@ -298,13 +304,21 @@ def remember(
     scope: str = "workspace",
     source_session: str | None = None,
     tags: list[str] | None = None,
+    force: bool = False,
+    compress_level: int = 0,
 ) -> int | None:
     """Store a new episodic memory. Returns row id or None if duplicate.
 
     After inserting, automatically links to similar memories via FTS5 BM25
     similarity search. Edges are is_manual=False (prunable by daily maintenance).
+
+    Args:
+        force: If True, bypasses dedup by appending timestamp to hash.
+        compress_level: 0=no compression, 1=dictionary compression (~40%).
     """
-    c_hash = _content_hash(content)
+    if compress_level > 0:
+        content = _compress(content, level=compress_level)
+    c_hash = _content_hash(content + str(_now_epoch()) if force else content)
     now_iso = _now_iso()
     now_epoch = _now_epoch()
     tags_json = json.dumps(tags) if tags else None
@@ -312,15 +326,18 @@ def remember(
         cursor = conn.execute(
             """INSERT INTO memories
                (session_id, workspace_id, content, category, importance,
-                scope, source_session, content_hash, created_at, created_at_epoch, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                scope, source_session, content_hash, created_at, created_at_epoch,
+                tags, compressed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, workspace_id, content, category, importance,
-             scope, source_session, c_hash, now_iso, now_epoch, tags_json),
+             scope, source_session, c_hash, now_iso, now_epoch, tags_json,
+             compress_level),
         )
         conn.commit()
         new_id = cursor.lastrowid
         # Auto-link similar memories (fire-and-forget, best-effort)
-        _auto_link_similar(conn, new_id, workspace_id)
+        if new_id:
+            _auto_link_similar(conn, new_id, workspace_id)
         return new_id
     except sqlite3.IntegrityError as exc:
         err_str = str(exc)
@@ -331,6 +348,30 @@ def remember(
         raise ValueError(f"Cannot save memory: {err_str} (category='{category}', importance={importance}, session='{session_id}')") from exc
 
 
+def _decompress_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Decompress content of memories that were stored compressed."""
+    try:
+        for r in results:
+            if r.get("compressed", 0) > 0:
+                r["content"] = _decompress(r["content"])
+    except ImportError:
+        pass  # compress module not available
+    return results
+
+
+def _apply_source_filter(source_filter: str | None) -> tuple[str, list]:
+    """Return (SQL clause, params) for filtering by source via tags.
+
+    Args:
+        source_filter: 'automation' | 'manual' | None (no filter)
+    """
+    if source_filter == "automation":
+        return "AND tags LIKE ?", [r'%"source:automation"%']
+    elif source_filter == "manual":
+        return "AND tags LIKE ?", [r'%"source:manual"%']
+    return "", []
+
+
 def search_memory(
     conn: sqlite3.Connection,
     query: str,
@@ -338,6 +379,8 @@ def search_memory(
     scope: str | None = None,
     limit: int = 20,
     include_inactive: bool = False,
+    decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Full-text search on memories. Returns list of matching memories.
 
@@ -346,7 +389,8 @@ def search_memory(
     """
     scope_filter = "AND scope = ?" if scope else ""
     lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
-    params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    params: list[Any] = [workspace_id] + source_params
     if scope:
         params.append(scope)
 
@@ -358,6 +402,7 @@ def search_memory(
                 JOIN memories_fts fts ON m.id = fts.rowid
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
+                {source_clause}
                 {scope_filter}
                 {lifecycle_filter}
                 ORDER BY (bm25(memories_fts) * -1.0 * 0.7) + (m.importance * 0.3) DESC
@@ -365,26 +410,33 @@ def search_memory(
             [fts_query] + params + [limit],
         ).fetchall()
         if rows:
-            return [dict(r) for r in rows]
+            results = [dict(r) for r in rows]
+            if decompress:
+                results = _decompress_results(results)
+            return results
     except sqlite3.OperationalError:
         pass  # FTS5 query syntax error, fall back to LIKE
 
     # Fallback: LIKE search — build params independently to avoid scope binding bug
     like_pattern = f"%{query}%"
-    like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+    like_params: list[Any] = [workspace_id, like_pattern, like_pattern] + source_params
     if scope:
         like_params.append(scope)
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
             AND (content LIKE ? OR category LIKE ?)
+            {source_clause}
             {scope_filter}
             {lifecycle_filter}
             ORDER BY importance DESC, created_at_epoch DESC
             LIMIT ?""",
         like_params + [limit],
     ).fetchall()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+    if decompress:
+        results = _decompress_results(results)
+    return results
 
 
 def _rrf_score(
@@ -412,6 +464,8 @@ def hybrid_search(
     scope: str | None = None,
     limit: int = 20,
     k: int = 60,
+    decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """RRF Hybrid Search: fuses BM25 (FTS5) + word-overlap ranking.
 
@@ -419,7 +473,8 @@ def hybrid_search(
     Falls back to LIKE search if FTS5 pool is empty.
     """
     scope_filter = "AND m.scope = ?" if scope else ""
-    base_params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    base_params: list[Any] = [workspace_id] + source_params
     if scope:
         base_params.append(scope)
 
@@ -435,6 +490,7 @@ def hybrid_search(
                 JOIN memories_fts fts ON m.id = fts.rowid
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
+                {source_clause}
                 {scope_filter}
                 ORDER BY bm25(memories_fts) ASC
                 LIMIT ?""",
@@ -442,7 +498,7 @@ def hybrid_search(
         ).fetchall()
         bm25_rows = [dict(r) for r in rows]
     except sqlite3.OperationalError:
-        pass
+        logger.debug("FTS5 query syntax error, fallback to word-overlap")
 
     # Source 2: Word-overlap (Jaccard-like on query terms)
     query_words = set(re.sub(r"[^a-zA-Z0-9\s]", "", query).lower().split())
@@ -475,13 +531,14 @@ def hybrid_search(
     # Fallback LIKE if pool is empty
     if not results:
         like_pattern = f"%{query}%"
-        like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+        like_params: list[Any] = [workspace_id, like_pattern, like_pattern] + source_params
         if scope:
             like_params.append(scope)
         scope_like_filter = "AND scope = ?" if scope else ""
         fallback_rows = conn.execute(
             f"""SELECT * FROM memories
                 WHERE workspace_id = ? AND (content LIKE ? OR category LIKE ?)
+                {source_clause}
                 {scope_like_filter}
                 ORDER BY importance DESC, created_at_epoch DESC
                 LIMIT ?""",
@@ -489,6 +546,8 @@ def hybrid_search(
         ).fetchall()
         results = [dict(r) for r in fallback_rows]
 
+    if decompress:
+        results = _decompress_results(results)
     return results
 
 
@@ -499,6 +558,8 @@ def get_recent_memory(
     limit: int = 10,
     max_tokens: int | None = None,
     include_inactive: bool = False,
+    decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Get most relevant memories, ranked by importance with time decay.
 
@@ -507,7 +568,8 @@ def get_recent_memory(
     """
     scope_filter = "AND scope = ?" if scope else ""
     lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
-    params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    params: list[Any] = [workspace_id] + source_params
     if scope:
         params.append(scope)
 
@@ -516,6 +578,7 @@ def get_recent_memory(
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
+            {source_clause}
             {scope_filter}
             {lifecycle_filter}
             ORDER BY created_at_epoch DESC
@@ -540,7 +603,10 @@ def get_recent_memory(
             result.append(m)
         return result
 
-    return scored[:limit]
+    results = scored[:limit]
+    if decompress:
+        results = _decompress_results(results)
+    return results
 
 
 # ─── Facts CRUD ──────────────────────────────────────────────────────
@@ -797,7 +863,7 @@ def get_latest_summary(
                 try:
                     result[field] = json.loads(result[field])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.debug("Failed to parse tags JSON")
         return result
     return None
 
@@ -981,6 +1047,22 @@ def daily_maintenance(
     except Exception:
         procedures_updated = 0
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    # ── Hot backup ────────────────────────────────────────────
+    # Creates a point-in-time backup of the database file.
+    # SQLite online backup API via .backup command.
+    try:
+        import shutil
+        _db_path = _db_path(workspace_id)
+        backup_path = _db_path.parent / f"{workspace_id}.backup-{_now_epoch()}.db"
+        shutil.copy2(str(_db_path), str(backup_path))
+        # Keep only last 3 backups
+        backups = sorted(_db_path.parent.glob(f"{workspace_id}.backup-*.db"))
+        for old_backup in backups[:-3]:
+            old_backup.unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Backup failed (non-fatal)", exc_info=True)
+
     conn.executescript("VACUUM;")
     return {
         "deleted_memories": deleted_mem,
@@ -1136,7 +1218,8 @@ def link_memories(
         )
         conn.commit()
         return cursor.lastrowid if cursor.rowcount > 0 else None
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        logger.warning("Failed to create memory relation: %s", e)
         return None
 
 
@@ -1426,16 +1509,18 @@ def get_memory_stats(
     conn,
     workspace_id: str,
     scope=None,
+    source_filter: str | None = None,
 ):
     """Aggregate stats for a workspace: counts, averages, edge breakdown."""
     scope_filter = "AND scope = ?" if scope else ""
-    base_params = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    base_params = [workspace_id] + source_params
     if scope:
         base_params.append(scope)
 
     rows = conn.execute(
         "SELECT category, COUNT(*) AS cnt FROM memories"
-        " WHERE workspace_id = ? " + scope_filter +
+        " WHERE workspace_id = ? " + source_clause + " " + scope_filter +
         " GROUP BY category",
         base_params,
     ).fetchall()
@@ -1444,13 +1529,13 @@ def get_memory_stats(
 
     core_row = conn.execute(
         "SELECT COUNT(*) FROM memories"
-        " WHERE workspace_id = ? AND is_core = 1 " + scope_filter,
+        " WHERE workspace_id = ? AND is_core = 1 " + source_clause + " " + scope_filter,
         base_params,
     ).fetchone()
     core_memories = core_row[0] if core_row else 0
 
     avg_row = conn.execute(
-        "SELECT AVG(importance) FROM memories WHERE workspace_id = ? " + scope_filter,
+        "SELECT AVG(importance) FROM memories WHERE workspace_id = ? " + source_clause + " " + scope_filter,
         base_params,
     ).fetchone()
     avg_importance = round(avg_row[0] or 0.0, 2)
@@ -1802,11 +1887,21 @@ def save_procedure(
     confidence: float = 0.5,
     source_memory_ids: list[int] | None = None,
     status: str = "active",
+    verify_command: str | None = None,
+    acceptance_criteria: str | None = None,
+    spec_text: str | None = None,
+    mode: str = "manual",
 ) -> int:
     """Upsert a procedure (keyed by workspace_id + name). Returns procedure id.
 
     If a procedure with the same name already exists in the workspace it is
     updated in place; the FTS5 index is kept in sync via explicit delete/insert.
+
+    Args:
+        mode: "manual" (default) | "cavekit" (spec-driven with verify_command)
+        verify_command: Shell command to verify the procedure succeeded
+        acceptance_criteria: Criteria that define success
+        spec_text: Original spec that generated this procedure (cavekit mode)
     """
     now_epoch = _now_epoch()
     src_ids_json = json.dumps(source_memory_ids) if source_memory_ids else None
@@ -1826,9 +1921,12 @@ def save_procedure(
         conn.execute(
             """UPDATE procedures
                SET trigger_context = ?, steps_md = ?, confidence = ?,
-                   source_memory_ids = ?, updated_at_epoch = ?, status = ?
+                   source_memory_ids = ?, updated_at_epoch = ?, status = ?,
+                   verify_command = ?, acceptance_criteria = ?, spec_text = ?,
+                   mode = ?
                WHERE id = ?""",
-            (trigger_context, steps_md, confidence, src_ids_json, now_epoch, status, proc_id),
+            (trigger_context, steps_md, confidence, src_ids_json, now_epoch, status,
+             verify_command, acceptance_criteria, spec_text, mode, proc_id),
         )
         # Sync FTS5: DELETE old row by rowid, then insert updated content
         conn.execute("DELETE FROM procedures_fts WHERE rowid = ?", (proc_id,))
@@ -1840,10 +1938,12 @@ def save_procedure(
         cursor = conn.execute(
             """INSERT INTO procedures
                (workspace_id, name, trigger_context, steps_md, confidence,
-                source_memory_ids, created_at_epoch, updated_at_epoch, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_memory_ids, created_at_epoch, updated_at_epoch, status,
+                verify_command, acceptance_criteria, spec_text, mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (workspace_id, name, trigger_context, steps_md, confidence,
-             src_ids_json, now_epoch, now_epoch, status),
+             src_ids_json, now_epoch, now_epoch, status,
+             verify_command, acceptance_criteria, spec_text, mode),
         )
         proc_id = cursor.lastrowid
         conn.execute(
@@ -1908,6 +2008,121 @@ def get_applicable_procedures(
     active = [r for r in candidates if r.get("status") == "active"]
     active.sort(key=lambda r: r.get("confidence", 0.5), reverse=True)
     return active[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Sprint 10: Cavekit Workflow
+# ---------------------------------------------------------------------------
+
+
+def spec_to_plan(spec_text: str, name: str | None = None) -> dict[str, Any]:
+    """Converts a natural language spec into a structured plan with tasks.
+
+    This is a template-based parser that extracts tasks from common spec
+    patterns. For full spec-to-plan conversion, use an LLM with this
+    function as the structured output schema.
+
+    Args:
+        spec_text: The specification text
+        name: Optional plan name (default: first line of spec)
+
+    Returns:
+        dict with: name, spec, tasks[], verify_command
+    """
+    lines = spec_text.strip().split("\n")
+    title = name or (lines[0][:60] if lines else "Untitled Plan")
+
+    tasks = []
+    verify_commands = []
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Task: numbered items like "1. Do X" or "- [ ] Do X"
+        task_match = None
+        for prefix_pattern in [
+            r"^\d+[\.\)]\s+(.+)",
+            r"^-\s+\[.\]\s+(.+)",
+            r"^\*\s+(.+)",
+            r"^Task\s+\d+[\:\.]\s+(.+)",
+        ]:
+            import re as _re
+            m = _re.match(prefix_pattern, line)
+            if m:
+                task_match = m.group(1)
+                break
+
+        if task_match:
+            # Extract verify command if present in brackets
+            verify = ""
+            criteria = ""
+            vmatch = _re.search(r"\[verify:\s*(.+?)\]", task_match)
+            if vmatch:
+                verify = vmatch.group(1).strip()
+                task_match = _re.sub(r"\[verify:\s*.+?\]", "", task_match).strip()
+            cmatch = _re.search(r"\[criteria:\s*(.+?)\]", task_match)
+            if cmatch:
+                criteria = cmatch.group(1).strip()
+                task_match = _re.sub(r"\[criteria:\s*.+?\]", "", task_match).strip()
+
+            tasks.append({
+                "id": len(tasks) + 1,
+                "title": task_match[:100],
+                "verify_command": verify,
+                "acceptance_criteria": criteria or f"{task_match[:60]} completed successfully",
+                "status": "pending",
+            })
+            if verify:
+                verify_commands.append(verify)
+
+    if not tasks:
+        # Fallback: whole spec as single task
+        tasks.append({
+            "id": 1,
+            "title": spec_text[:100],
+            "verify_command": "",
+            "acceptance_criteria": "Spec implemented successfully",
+            "status": "pending",
+        })
+
+    return {
+        "name": title,
+        "spec": spec_text,
+        "tasks": tasks,
+        "total_tasks": len(tasks),
+        "verify_command": " && ".join(verify_commands) if verify_commands else "",
+    }
+
+
+def plan_to_tasks_text(plan: dict[str, Any]) -> str:
+    """Format a plan as readable text with task checklist."""
+    lines = [
+        f"# Plan: {plan.get('name', 'Untitled')}",
+        f"Total tasks: {plan['total_tasks']}",
+        "",
+    ]
+
+    if plan.get("spec"):
+        lines.append("## Spec")
+        lines.append(plan["spec"][:300])
+        lines.append("")
+
+    lines.append("## Tasks")
+    for t in plan.get("tasks", []):
+        status_mark = "[ ]" if t.get("status") == "pending" else "[x]"
+        lines.append(f"  {status_mark} Task #{t['id']}: {t['title']}")
+        if t.get("acceptance_criteria"):
+            lines.append(f"     AC: {t['acceptance_criteria']}")
+        if t.get("verify_command"):
+            lines.append(f"     Verify: {t['verify_command']}")
+        lines.append("")
+
+    if plan.get("verify_command"):
+        lines.append(f"Global verify: {plan['verify_command']}")
+
+    return "\n".join(lines)
 
 
 def list_procedures(
@@ -2169,6 +2384,120 @@ def get_graph_context(
     }
 
 
+# ---------------------------------------------------------------------------
+# Sprint 10 — Shortest Path + Graph Query
+# ---------------------------------------------------------------------------
+
+
+def shortest_path(
+    conn: sqlite3.Connection,
+    source_id: int,
+    target_id: int,
+    workspace_id: str,
+    max_depth: int = 10,
+) -> list[dict[str, Any]] | None:
+    """BFS shortest path discovery in the knowledge graph.
+
+    Returns a list of edge dicts forming the shortest path,
+    or None if no path exists within max_depth.
+    """
+    if source_id == target_id:
+        return []
+
+    # BFS: node_id → (prev_node_id, edge_dict)
+    visited: dict[int, tuple[int | None, dict[str, Any]]] = {source_id: (None, {})}
+    queue: list[int] = [source_id]
+    found = False
+
+    while queue and len(visited) <= max_depth + 1:
+        current = queue.pop(0)
+        if current == target_id:
+            found = True
+            break
+
+        edges = conn.execute(
+            """SELECT id, source_id, target_id, relation, confidence_type, weight
+               FROM memory_relations
+               WHERE workspace_id = ? AND (source_id = ? OR target_id = ?)""",
+            (workspace_id, current, current),
+        ).fetchall()
+
+        for e in edges:
+            neighbor = e["target_id"] if e["source_id"] == current else e["source_id"]
+            if neighbor not in visited:
+                visited[neighbor] = (current, dict(e))
+                queue.append(neighbor)
+
+    if not found:
+        return None
+
+    # Reconstruct path from target to source, then reverse
+    path: list[dict[str, Any]] = []
+    node = target_id
+    while node != source_id:
+        prev_info = visited.get(node)
+        if prev_info is None:
+            break
+        prev_node, edge = prev_info
+        if not edge:
+            break
+        path.append(edge)
+        node = prev_node  # type: ignore[assignment]
+
+    path.reverse()
+    return path
+
+
+def query_graph(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    tag: str | None = None,
+    category: str | None = None,
+    min_importance: int = 1,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Query the graph: filter nodes by tag/category/importance + return their edges.
+
+    Returns {"nodes": [...], "edges": [...], "count": N}.
+    """
+    where_clauses: list[str] = ["workspace_id = ?"]
+    params: list[Any] = [workspace_id]
+
+    if tag:
+        where_clauses.append("tags LIKE ?")
+        params.append(f'%"{tag}"%')
+    if category:
+        where_clauses.append("category = ?")
+        params.append(category)
+
+    params.append(min_importance)
+    params.append(limit)
+
+    query = "SELECT * FROM memories WHERE " + " AND ".join(where_clauses)
+    query += " AND importance >= ? AND (lifecycle_status IS NULL OR lifecycle_status = 'active') ORDER BY importance DESC LIMIT ?"
+    memories = conn.execute(query, params).fetchall()
+
+    ids = [m["id"] for m in memories]
+
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        edges = conn.execute(
+            """SELECT * FROM memory_relations
+                WHERE workspace_id = ?
+                AND (source_id IN (%s) OR target_id IN (%s))"""
+            % (placeholders, placeholders),
+            [workspace_id] + ids + ids,
+        ).fetchall()
+    else:
+        edges = []
+
+    return {
+        "nodes": [dict(m) for m in memories],
+        "edges": [dict(e) for e in edges],
+        "count": len(memories),
+    }
+
+
 def batch_remember(
     conn: sqlite3.Connection,
     entries: list[dict[str, Any]],
@@ -2385,6 +2714,119 @@ def export_session_traces(
     if not rows:
         return ""
     lines = [json.dumps(dict(r), default=str, ensure_ascii=False) for r in rows]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 10: Graph Visualization Helpers
+# ---------------------------------------------------------------------------
+
+
+def get_memories_for_graph(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Get all active memories for graph visualization."""
+    rows = conn.execute(
+        """SELECT id, content, category, importance, tags, created_at, scope
+           FROM memories
+           WHERE workspace_id = ?
+           AND (lifecycle_status IS NULL OR lifecycle_status = 'active')
+           ORDER BY importance DESC, created_at_epoch DESC
+           LIMIT ?""",
+        (workspace_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def export_graphml(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+) -> str:
+    """Export the graph as GraphML XML string (compatible with Gephi, yEd)."""
+    memories = get_memories_for_graph(conn, workspace_id)
+    edges = get_all_relations(conn, workspace_id)
+
+    mem_ids = {m["id"] for m in memories}
+    def _src(e): return e.get("source_id") or e.get("source")
+    def _tgt(e): return e.get("target_id") or e.get("target")
+    valid_edges = [e for e in edges if _src(e) in mem_ids and _tgt(e) in mem_ids]
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns"',
+        '  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+        '  <key id="d0" for="node" attr.name="category" attr.type="string"/>',
+        '  <key id="d1" for="node" attr.name="importance" attr.type="int"/>',
+        '  <key id="d2" for="edge" attr.name="relation" attr.type="string"/>',
+        '  <key id="d3" for="edge" attr.name="confidence" attr.type="string"/>',
+        '  <key id="d4" for="node" attr.name="preview" attr.type="string"/>',
+        '  <graph id="G" edgedefault="directed">',
+    ]
+
+    for m in memories:
+        preview = html.escape(m.get("content", "")[:100])
+        lines.append(
+            f'    <node id="n{m["id"]}">'
+            f'<data key="d0">{m["category"]}</data>'
+            f'<data key="d1">{m["importance"]}</data>'
+            f'<data key="d4">{preview}</data>'
+            f'</node>'
+        )
+
+    for e in valid_edges:
+        src = _src(e)
+        tgt = _tgt(e)
+        lines.append(
+            f'    <edge source="n{src}" target="n{tgt}">'
+            f'<data key="d2">{e["relation"]}</data>'
+            f'<data key="d3">{e.get("confidence_type", "unknown")}</data>'
+            f'</edge>'
+        )
+
+    lines.append('  </graph>')
+    lines.append('</graphml>')
+    return "\n".join(lines)
+
+
+def export_cypher(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+) -> str:
+    """Export the graph as Cypher queries (compatible with Neo4j)."""
+    memories = get_memories_for_graph(conn, workspace_id)
+    edges = get_all_relations(conn, workspace_id)
+
+    mem_ids = {m["id"] for m in memories}
+    def _src(e): return e.get("source_id") or e.get("source")
+    def _tgt(e): return e.get("target_id") or e.get("target")
+    valid_edges = [e for e in edges if _src(e) in mem_ids and _tgt(e) in mem_ids]
+
+    lines = ["// Craft Memory Graph Export — Cypher for Neo4j", f"// Generated: {__import__('datetime').datetime.now()}", ""]
+
+    for m in memories:
+        preview = m.get("content", "")[:80].replace("\\", "\\\\").replace('"', '\\"')
+        cat = m.get("category", "note")
+        imp = m.get("importance", 5)
+        lines.append(
+            f'CREATE (n{m["id"]}:Memory {{id: {m["id"]}, '
+            f'category: "{cat}", importance: {imp}, '
+            f'preview: "{preview}"}});'
+        )
+
+    lines.append("")
+    for e in valid_edges:
+        rel = e.get("relation", "RELATED").upper().replace(" ", "_")
+        conf = e.get("confidence_type", "extracted")
+        src = _src(e)
+        tgt = _tgt(e)
+        lines.append(
+            f'MATCH (a:Memory {{id: {src}}}), '
+            f'(b:Memory {{id: {tgt}}}) '
+            f'CREATE (a)-[:{rel} {{confidence: "{conf}"}}]->(b);'
+        )
+
     return "\n".join(lines)
 
 

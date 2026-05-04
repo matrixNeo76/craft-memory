@@ -38,3 +38,7 @@ Thumbs.db
 # Secrets / env
 .env
 .env.*
+
+# Temporary/one-off scripts
+scripts/fix_*.py
+scripts/memory-cleanup.py

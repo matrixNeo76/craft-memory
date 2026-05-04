@@ -198,7 +198,18 @@ Later, `search_memory("source_url:anthropic.com")` finds all memories derived fr
 | **SessionDB** | `get_high_quality_sessions` and `export_session_traces` (JSONL) provide the data bridge for self-improvement loops, fine-tuning, and evaluation datasets (Hermes/GEPA pattern) |
 | **Wiki health check** | `lint_wiki()` scans the knowledge base for contradictions (same-key-prefix different values), orphan memories (no graph edges), pending reviews, low-confidence facts, high-importance unlinked memories, and lifecycle inconsistencies. Run periodically to keep the KB healthy |
 | **Obsidian wiki export** | `export_wiki(output_dir)` generates an interlinked markdown wiki from all memories — YAML frontmatter, [[wikilink]] neighbors, index.md by category, edges.md, log.md. Open the output dir in Obsidian for native graph view and Dataview queries |
+| **Deterministic compression** | `remember(compress_level=1)` compresses content ~39% using a 48-pattern dictionary. Reversible via `search_memory(decompress=True)` or `decompress()` function. Level 1 is case-sensitive, safe for all content. |
+| **Shortest path** | `shortest_path(source_id, target_id, max_depth=10)` finds the BFS shortest route between two memories through the knowledge graph, showing each hop with relation type |
+| **Subgraph extraction** | `subgraph(memory_id, depth=2)` extracts the BFS neighborhood around a memory node — up to 4 hops with all edges, for local graph context |
+| **Graph query** | `query_graph(tag, category, min_importance, limit)` filters nodes by tag/category + importance and returns their edges in one structured query |
+| **Leiden community detection** | `get_communities(resolution=1.0)` applies Louvain/Leiden clustering on the knowledge graph — groups semantically related nodes without embeddings. `resolution > 1.0` = more granular communities |
+| **Interactive HTML graph** | `export_graph_html(output_path)` generates a self-contained HTML file with D3.js force-directed graph: nodes colored by community, sized by importance, tooltips, search bar, confidence/category filters, zoom/pan/drag, sidebar stats |
+| **GraphML export** | `export_graphml(output_path)` exports the graph as GraphML XML — compatible with Gephi and yEd for professional graph visualization and analysis |
+| **Cypher export** | `export_cypher(output_path)` exports the graph as Cypher CREATE/MATCH queries — import directly into Neo4j for advanced graph analytics |
 | **Source tracking** | `source_url` + `source_title` columns on memories (migration 013) allow tracing knowledge provenance. Use `remember(source_url="...")` when extracting info from articles, papers, or web pages |
+| **Spec-driven workflow (Cavekit)** | `save_procedure(mode="cavekit", verify_command=..., acceptance_criteria=...)` enables spec→plan→verify workflow. Use `spec_to_plan(spec)` to auto-generate structured plans with tasks. Track outcomes with `record_procedure_outcome_and_advance()` — confidence evolves via Bayesian blend |
+| **Code analyzer (external)** | `craft-code-mapper` is a separate MCP source for AST-based code analysis: Python (stdlib), JavaScript/TypeScript (tree-sitter). Scans directories, extracts classes/functions/imports/call graph, saves everything as memories + relations in craft-memory |
+| **CLI orchestration** | `craft-memory analyze <dir>` → calls craft-code-mapper to scan code and save to graph. `craft-memory graph [output.html]` → generates interactive graph. `craft-memory watch <dir>` → periodic re-analysis |
 | **Prometheus metrics** | `GET /metrics` exposes memories, facts, open loops, procedures, avg confidence, db_size in Prometheus text format — Grafana-ready without MCP overhead |
 
 ---
@@ -263,7 +274,39 @@ Later, `search_memory("source_url:anthropic.com")` finds all memories derived fr
 | `rate_session(summary_id, score, notes)` | Assign quality score 0.0–1.0 to a session summary for SessionDB |
 | **— Sprint 9: SessionDB Foundation —** | |
 | `get_high_quality_sessions(min_score, limit)` | Return session summaries scored >= min_score; positive examples for self-improvement |
+```bash
+craft-memory ensure      # Start server if not running (used in automations)
+craft-memory serve       # Start server in foreground
+craft-memory check       # Check if server is running (exit 0=up, 2=down)
+craft-memory stop        # Stop the running server
+craft-memory status      # Print server status as JSON
+craft-memory install --workspace PATH   # Install source into a workspace
+craft-memory analyze <dir>   # Analyze code via craft-code-mapper + save to graph
+craft-memory graph [output]  # Generate interactive HTML knowledge graph
+craft-memory watch <dir>     # Watch directory and re-analyze periodically
+```
+
+## Features (continued)
+
+...
+
+## MCP Tools (continued)
+
+...
+
 | `export_session_traces(min_score, limit)` | Export rated sessions as JSONL for training, eval, or DSPy optimization |
+| **— Sprint 10: Graph Visualization + Query —** | |
+| `shortest_path(source_id, target_id, max_depth)` | BFS shortest path between two memories in the graph |
+| `subgraph(memory_id, depth)` | BFS local context around a memory node |
+| `query_graph(tag, category, min_importance, limit)` | Filter nodes by tag/category/importance + return edges |
+| `get_communities(resolution)` | Leiden/Louvain community detection on the knowledge graph |
+| `export_graph_html(output_path, resolution, limit)` | Generate D3.js interactive force-directed graph HTML |
+| `export_graphml(output_path)` | Export graph as GraphML for Gephi/yEd |
+| `export_cypher(output_path)` | Export graph as Cypher queries for Neo4j |
+| **— Sprint 10: Cavekit Workflow —** | |
+| `save_procedure(..., mode, verify_command, acceptance_criteria, spec_text)` | Extended procedure with spec-driven verification mode |
+| `spec_to_plan(spec_text, name)` | Convert a specification into a structured plan with tasks |
+| `record_procedure_outcome_and_advance(procedure_id, outcome, notes, next_task_id)` | Record execution outcome and advance workflow; confidence evolves automatically |
 
 **HTTP Endpoints** (not MCP tools — direct HTTP):
 | Endpoint | Purpose |
@@ -355,8 +398,12 @@ craft-memory install --workspace PATH   # Install source into a workspace
 craft-memory/
 ├── src/
 │   ├── craft_memory_mcp/    # Canonical package (installed by pip)
-│   │   ├── server.py        # FastMCP server, 46 tools, /health + /metrics endpoints
+│   │   ├── server.py        # FastMCP server, 57 tools, /health + /metrics endpoints
 │   │   ├── db.py            # SQLite layer (WAL, FTS5, dedup, decay)
+│   │   ├── cli.py           # craft-memory CLI (analyze, graph, watch)
+│   │   ├── compress.py      # Deterministic text compression (level 1, ~39%)
+│   │   ├── clustering.py    # Leiden/Louvain community detection
+│   │   ├── graph_viz.py     # D3.js force-directed graph HTML generation
 │   │   ├── schema.sql       # 6 tables + FTS virtual table + triggers
 │   │   ├── migrations/      # Versioned SQL migrations (applied on startup)
 │   │   │   ├── 002_global_dedup.sql

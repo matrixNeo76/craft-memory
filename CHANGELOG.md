@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.3.0] (2026-05-04)
+
+### Features
+
+* **source_filter:** `get_recent_memory(source_filter='automation'), search_memory(source_filter='manual'), memory_stats(source_filter='automation')` — filtra memorie per origine via tags JSON (Phase 7)
+* **exposure:** tags e session_id ora visibili nei risultati di `get_recent_memory()` e `search_memory()` per tracciabilità dell'origine (Phase 7)
+* **filter:** helper SQL `_apply_source_filter()` riutilizzabile in tutte le query DB (Phase 7)
+
+### Documentation
+
+* **architecture:** v9.0 — Phase 7 source_filter documented
+
+## [0.2.0] (2026-05-04)
+
+### Features
+
+* **compression:** deterministic text compression ~39% (level 1, 48 patterns, reversible) — `remember(compress_level=1)`, `search_memory(decompress=True)` (Phase 1)
+* **cache:** `remember(force=True)` bypasses dedup for re-saving updated content (Phase 1)
+* **query:** `shortest_path(source_id, target_id)` — BFS shortest path in knowledge graph (Phase 1)
+* **query:** `subgraph(memory_id, depth)` — BFS local context extraction (Phase 1)
+* **query:** `query_graph(tag, category, min_importance, limit)` — filtered node+edge query (Phase 1)
+* **visualization:** `get_communities(resolution)` — Leiden/Louvain community detection without embeddings (Phase 2)
+* **visualization:** `export_graph_html(output_path)` — self-contained D3.js force-directed graph with community colors, tooltips, search, filters (Phase 2)
+* **export:** `export_graphml(output_path)` — GraphML format for Gephi/yEd (Phase 2)
+* **export:** `export_cypher(output_path)` — Cypher queries for Neo4j (Phase 2)
+* **code-analyzer:** new external project `craft-code-mapper` — AST extraction for Python (stdlib), JavaScript/TypeScript (tree-sitter). Scans directories, stores classes/functions/imports/call graph as memories + relations in craft-memory (Phase 3)
+* **cavekit:** `save_procedure(mode="cavekit", verify_command, acceptance_criteria, spec_text)` — spec-driven workflow mode (Phase 4)
+* **cavekit:** `spec_to_plan(spec_text)` — converts natural language spec to structured plan with tasks (Phase 4)
+* **cavekit:** `record_procedure_outcome_and_advance()` — record execution result, confidence evolves via Bayesian blend (Phase 4)
+* **middleware:** `McpClientPool.addMiddleware(pattern, handler)` — interceptor system for MCP tool calls in `craft-agents-oss` (Phase 5)
+* **cli:** `craft-memory analyze <dir>` — orchestrates code analysis via craft-code-mapper (Phase 6)
+* **cli:** `craft-memory graph [output]` — generates interactive HTML knowledge graph (Phase 6)
+* **cli:** `craft-memory watch <dir>` — periodic code re-analysis (Phase 6)
+* **docs:** complete guide.md updated with all new tools, CLI commands, external tools (Phase 6)
+
 ## [0.1.1](https://github.com/matrixNeo76/craft-memory/compare/v0.1.0...v0.1.1) (2026-05-01)
 
 
