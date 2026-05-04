@@ -9,6 +9,7 @@ Environment variables:
 import hashlib
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,9 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -475,7 +479,7 @@ def hybrid_search(
         ).fetchall()
         bm25_rows = [dict(r) for r in rows]
     except sqlite3.OperationalError:
-        pass
+        logger.debug("FTS5 query syntax error, fallback to word-overlap")
 
     # Source 2: Word-overlap (Jaccard-like on query terms)
     query_words = set(re.sub(r"[^a-zA-Z0-9\s]", "", query).lower().split())
@@ -836,7 +840,7 @@ def get_latest_summary(
                 try:
                     result[field] = json.loads(result[field])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.debug("Failed to parse tags JSON")
         return result
     return None
 
@@ -1175,7 +1179,8 @@ def link_memories(
         )
         conn.commit()
         return cursor.lastrowid if cursor.rowcount > 0 else None
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        logger.warning("Failed to create memory relation: %s", e)
         return None
 
 

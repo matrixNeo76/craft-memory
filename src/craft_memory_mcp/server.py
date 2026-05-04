@@ -22,14 +22,11 @@ import json
 import os
 import re as _re
 import sys
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any
 
-try:
-    _VERSION = _pkg_version("craft-memory-mcp")
-except PackageNotFoundError:
-    _VERSION = "dev"
+from craft_memory_mcp import __version__ as _VERSION
 
 _PRIVATE_PATTERNS = _re.compile(
     r"<(private|system-reminder|system-instruction|system)>.*?</\1>",
@@ -256,8 +253,41 @@ async def metrics(request):
     return PlainTextResponse("\n\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
-# Global connection (one per server instance)
+# ─── Thread safety ────────────────────────────────────────────────
+import threading as _threading
+
+_conn_lock = _threading.Lock()
 _conn = None
+
+_write_count = 0
+_CHECKPOINT_EVERY = 50
+
+
+def _maybe_checkpoint(conn) -> None:
+    global _write_count
+    with _conn_lock:
+        _write_count += 1
+        if _write_count >= _CHECKPOINT_EVERY:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            _write_count = 0
+
+
+def _get_conn():
+    global _conn
+    with _conn_lock:
+        if _conn is not None:
+            try:
+                _conn.execute("SELECT 1")
+            except Exception:
+                _conn = None
+        if _conn is None:
+            _conn = _db_get_connection(WORKSPACE_ID)
+            _db_register_session(_conn, CRAFT_SESSION_ID, WORKSPACE_ID)
+        return _conn
+
 
 # WAL checkpoint counter — flush WAL every N writes to keep file size bounded
 _write_count = 0
