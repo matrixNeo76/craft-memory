@@ -1023,6 +1023,22 @@ def daily_maintenance(
     except Exception:
         procedures_updated = 0
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    # ── Hot backup ────────────────────────────────────────────
+    # Creates a point-in-time backup of the database file.
+    # SQLite online backup API via .backup command.
+    try:
+        import shutil
+        _db_path = _db_path(workspace_id)
+        backup_path = _db_path.parent / f"{workspace_id}.backup-{_now_epoch()}.db"
+        shutil.copy2(str(_db_path), str(backup_path))
+        # Keep only last 3 backups
+        backups = sorted(_db_path.parent.glob(f"{workspace_id}.backup-*.db"))
+        for old_backup in backups[:-3]:
+            old_backup.unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Backup failed (non-fatal)", exc_info=True)
+
     conn.executescript("VACUUM;")
     return {
         "deleted_memories": deleted_mem,

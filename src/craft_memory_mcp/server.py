@@ -209,6 +209,38 @@ async def health_check(request):
     })
 
 
+@mcp.custom_route("/health/liveness", methods=["GET"])
+async def health_liveness(request):
+    """Liveness probe — always 200 if the server process is alive."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "alive", "service": "craft-memory", "version": _VERSION})
+
+
+@mcp.custom_route("/health/readiness", methods=["GET"])
+async def health_readiness(request):
+    """Readiness probe — 200 when DB is connected and migrations have run."""
+    from starlette.responses import JSONResponse
+    try:
+        conn = _get_conn()
+        conn.execute("SELECT 1")
+        # Check migrations ran
+        version = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()
+        db_status = "ready"
+        msg = f"migrations at v{version[0] if version else 0}"
+    except Exception as e:
+        db_status = "not_ready"
+        msg = str(e)
+
+    status_code = 200 if db_status == "ready" else 503
+    return JSONResponse({
+        "status": db_status,
+        "service": "craft-memory",
+        "version": _VERSION,
+        "message": msg,
+        "workspace": WORKSPACE_ID,
+    }, status_code=status_code)
+
+
 # ─── Prometheus-compatible metrics endpoint (HTTP transport only) ─────
 
 @mcp.custom_route("/metrics", methods=["GET"])
@@ -277,6 +309,26 @@ def _check_rate_limit() -> str | None:
         if now - oldest < 1.0:
             return f"Rate limit exceeded: max {_RATE_LIMIT} calls per second. Wait and retry."
     return None
+
+
+# ─── Graph cache ─────────────────────────────────────────────────────
+_graph_cache: dict = {}
+_GRAPH_CACHE_TTL = 5.0
+
+
+def _get_cached_graph(key: str, fetcher):
+    """Simple TTL cache for graph data. Invalidated on link_memories()."""
+    now = _time.time()
+    cached = _graph_cache.get(key)
+    if cached and now - cached[0] < _GRAPH_CACHE_TTL:
+        return cached[1]
+    result = fetcher()
+    _graph_cache[key] = (now, result)
+    return result
+
+
+def _invalidate_graph_cache():
+    _graph_cache.clear()
 
 
 # ─── Thread safety ────────────────────────────────────────────────
@@ -394,8 +446,8 @@ def remember(
         return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(valid_categories))}"
     if not isinstance(importance, int) or importance < 1 or importance > 10:
         return f"Importance must be 1-10, got {importance}"
-    if not isinstance(compress_level, int) or compress_level < 0 or compress_level > 1:
-        return f"compress_level must be 0 or 1, got {compress_level}"
+    if not isinstance(compress_level, int) or compress_level < 0 or compress_level > 2:
+        return f"compress_level must be 0, 1 or 2, got {compress_level}"
     if tags is not None:
         if not isinstance(tags, list):
             return "Tags must be a list of strings"
@@ -410,6 +462,7 @@ def remember(
     )
     if mem_id is None:
         return "Duplicate memory skipped (same content already stored in this workspace)"
+    _invalidate_graph_cache()
     tag_str = f" tags={tags}" if tags else ""
     _maybe_checkpoint(conn)
     return f"Memory #{mem_id} stored: [{category}] (importance={importance}){tag_str}"
@@ -906,6 +959,7 @@ def link_memories(
     )
     if rel_id is None:
         return f"Relation already exists or invalid: #{source_id} --{relation}--> #{target_id}"
+    _invalidate_graph_cache()
     _maybe_checkpoint(conn)
     return f"Relation #{rel_id} created: #{source_id} --[{role}:{relation} w={weight}]--> #{target_id}"
 
@@ -2379,6 +2433,16 @@ def run_server():
         )
         from pathlib import Path
         from starlette.staticfiles import StaticFiles
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        @app.middleware("http")
+        async def add_security_headers(request, call_next):
+            response = await call_next(request)
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return response
 
         class NoCacheStaticFiles(StaticFiles):
             """StaticFiles that adds no-cache headers at ASGI level (no buffering)."""
