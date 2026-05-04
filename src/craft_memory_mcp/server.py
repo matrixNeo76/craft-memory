@@ -259,6 +259,26 @@ async def metrics(request):
     return PlainTextResponse("\n\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+# ─── Rate limiter ────────────────────────────────────────────────────
+# Prevents rapid-fire tool calls (max RATE_LIMIT calls per second)
+from collections import deque
+import time as _time
+
+_RATE_LIMIT = 30  # max calls per second
+_call_timestamps: deque = deque(maxlen=_RATE_LIMIT)
+
+
+def _check_rate_limit() -> str | None:
+    """Check rate limit. Returns error message if exceeded, None if OK."""
+    now = _time.time()
+    _call_timestamps.append(now)
+    if len(_call_timestamps) >= _RATE_LIMIT:
+        oldest = _call_timestamps[0]
+        if now - oldest < 1.0:
+            return f"Rate limit exceeded: max {_RATE_LIMIT} calls per second. Wait and retry."
+    return None
+
+
 # ─── Thread safety ────────────────────────────────────────────────
 import threading as _threading
 
@@ -359,6 +379,9 @@ def remember(
     Returns:
         Confirmation with memory ID or duplicate notice
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
     session_id = source_session or CRAFT_SESSION_ID
     content = _strip_private(content)
@@ -414,6 +437,9 @@ def search_memory(
     Returns:
         List of matching memories
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
     if use_rrf:
         results = _db_hybrid_search(conn, query, WORKSPACE_ID, scope=scope, limit=limit, decompress=decompress)
@@ -452,6 +478,9 @@ def get_recent_memory(
     Returns:
         List of recent memories
     """
+    rate_msg = _check_rate_limit()
+    if rate_msg:
+        return rate_msg
     conn = _get_conn()
     results = _db_get_recent_memory(conn, WORKSPACE_ID, scope, limit, max_tokens, decompress=decompress)
     if not results:
