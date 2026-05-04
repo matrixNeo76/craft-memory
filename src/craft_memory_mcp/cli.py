@@ -54,9 +54,21 @@ def is_alive() -> bool:
 
 # ─── Start server ────────────────────────────────────────────────────
 
+def _server_log_path() -> str:
+    """Return path to the server log file."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "craft-memory-server.log")
+
+
 def start_server(host: str | None = None, port: int | None = None,
                  transport: str = "http") -> int | None:
-    """Start the server as a detached background process."""
+    """Start the server as a detached background process.
+
+    Server stdout/stderr are redirected to a log file at:
+      {tempdir}/craft-memory-server.log
+
+    If the server crashes, check this file for the error traceback.
+    """
     h = host or _host()
     p = port or _port()
 
@@ -73,23 +85,34 @@ def start_server(host: str | None = None, port: int | None = None,
 
     cmd = [sys.executable, "-m", "craft_memory_mcp.server"]
 
+    # Log file for server stdout/stderr (instead of DEVNULL — so we can
+    # debug crashes):
+    log_path = _server_log_path()
+    log_file = open(log_path, "a", buffering=1)  # line-buffered
+    # Prepend a separator so each server start is distinguishable
+    log_file.write(f"\n--- Server start at {__import__('datetime').datetime.now()} PID=? ---\n")
+    log_file.flush()
+
     # Platform-specific detachment
     kwargs = dict(
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,  # stderr goes to SAME log file (so tracebacks are captured)
         close_fds=True,
     )
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
-        # Unix: start new session, detach from terminal
         kwargs["start_new_session"] = True
 
     try:
         proc = subprocess.Popen(cmd, **kwargs)
+        # Don't close log_file — the subprocess owns it now
+        # (closing would break when the subprocess writes to it)
         return proc.pid
     except Exception as e:
+        log_file.write(f"ERROR starting server: {e}\n")
+        log_file.close()
         print(f"ERROR: Failed to start server: {e}", file=sys.stderr)
         return None
 
@@ -208,8 +231,16 @@ def cmd_ensure(args):
     print(f"Server process started (PID {pid}), waiting for readiness...")
     if wait_for_alive():
         print(f"OK: Craft Memory server is ready at http://{_host()}:{_port()}/mcp")
+        print(f"     Server log: {_server_log_path()}")
     else:
-        print("ERROR: Server started but not responding after 10s", file=sys.stderr)
+        log_path = _server_log_path()
+        print(f"ERROR: Server started but not responding after 10s", file=sys.stderr)
+        if os.path.exists(log_path):
+            print(f"       Last 20 lines from {log_path}:", file=sys.stderr)
+            with open(log_path) as f:
+                lines = f.readlines()
+            for line in lines[-20:]:
+                print(f"       | {line.rstrip()}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -577,6 +608,104 @@ def cmd_scan(args):
     sys.exit(result.returncode)
 
 
+# ─── Analyze command (code analysis orchestration) ────────────────
+
+def cmd_analyze_code(args):
+    """Analyze a code directory via craft-code-mapper and save to memory."""
+    if not is_alive():
+        print("ERROR: craft-memory server is not running. Start with: craft-memory ensure")
+        sys.exit(1)
+
+    # Call craft-code-mapper as subprocess
+    cmd = ["craft-code-mapper", "scan", args.directory]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.force:
+        cmd.append("--force")
+    cmd.extend(["--memory-url", args.memory_url])
+
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, timeout=300)
+    sys.exit(result.returncode)
+
+
+# ─── Graph command (generate HTML) ───────────────────────────────────
+
+def cmd_graph(args):
+    """Generate interactive HTML knowledge graph."""
+    if not is_alive():
+        print("ERROR: craft-memory server is not running. Start with: craft-memory ensure")
+        sys.exit(1)
+
+    import httpx
+
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "export_graph_html",
+            "arguments": {
+                "output_path": os.path.abspath(args.output),
+                "resolution": args.resolution,
+                "limit": args.limit,
+            }
+        }
+    }
+
+    try:
+        resp = httpx.post(args.memory_url, json=payload, headers=headers, timeout=30)
+        result = resp.json()
+        text = result.get("result", {}).get("content", [{}])[0].get("text", "")
+        print(text)
+
+        if args.open:
+            import webbrowser
+            webbrowser.open(os.path.abspath(args.output))
+            print(f"Opened in browser: {os.path.abspath(args.output)}")
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ─── Watch command (periodic re-analysis) ────────────────────────────
+
+def cmd_watch(args):
+    """Watch directory and re-analyze on changes."""
+    import time as _time
+
+    if not is_alive():
+        print("ERROR: craft-memory server is not running. Start with: craft-memory ensure")
+        sys.exit(1)
+
+    print(f"Watching: {os.path.abspath(args.directory)}")
+    print(f"Interval: {args.interval}s")
+    print("Press Ctrl+C to stop.\n")
+
+    cmd = ["craft-code-mapper", "scan", args.directory, "--no-check"]
+    cmd.extend(["--memory-url", args.memory_url])
+
+    iteration = 0
+    while True:
+        iteration += 1
+        print(f"[{_time.strftime('%H:%M:%S')}] Scan #{iteration}...")
+        try:
+            result = subprocess.run(cmd, timeout=args.interval * 2, capture_output=True, text=True)
+            # Print last line of output (summary)
+            if result.stdout:
+                for line in result.stdout.strip().split("\n")[-8:]:
+                    print(f"  {line}")
+            if result.returncode != 0:
+                print(f"  WARN: exit code {result.returncode}")
+        except subprocess.TimeoutExpired:
+            print(f"  WARN: scan timed out")
+        except FileNotFoundError:
+            print(f"  ERROR: craft-code-mapper not found. Install with: pip install -e /path/to/craft-code-mapper")
+            sys.exit(1)
+
+        print(f"  Next scan in {args.interval}s...\n")
+        _time.sleep(args.interval)
+
+
 # ─── Argument parser ─────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -618,6 +747,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--timeout", type=int, default=120,
                         help="Max execution time in seconds (default: 120)")
 
+    # analyze (code analysis via craft-code-mapper)
+    p_analyze = sub.add_parser("analyze", help="Analyze code directory via craft-code-mapper")
+    p_analyze.add_argument("directory", help="Directory to analyze")
+    p_analyze.add_argument("--dry-run", action="store_true", help="Don\'t save to memory")
+    p_analyze.add_argument("--force", action="store_true", help="Re-analyze unchanged files")
+    p_analyze.add_argument("--memory-url", default="http://127.0.0.1:8392/mcp",
+                          help="craft-memory MCP URL")
+
+    # graph (generate HTML graph)
+    p_graph = sub.add_parser("graph", help="Generate interactive HTML knowledge graph")
+    p_graph.add_argument("output", nargs="?", default="memory-graph.html",
+                         help="Output HTML file path")
+    p_graph.add_argument("--resolution", type=float, default=1.0,
+                         help="Leiden clustering resolution (default: 1.0)")
+    p_graph.add_argument("--limit", type=int, default=500,
+                         help="Max nodes (default: 500)")
+    p_graph.add_argument("--open", action="store_true",
+                         help="Open graph in browser after generation")
+    p_graph.add_argument("--memory-url", default="http://127.0.0.1:8392/mcp",
+                         help="craft-memory MCP URL")
+
+    # watch (periodic code analysis)
+    p_watch = sub.add_parser("watch", help="Watch directory and re-analyze on changes")
+    p_watch.add_argument("directory", help="Directory to watch")
+    p_watch.add_argument("--interval", type=int, default=60,
+                         help="Poll interval in seconds (default: 60)")
+    p_watch.add_argument("--memory-url", default="http://127.0.0.1:8392/mcp",
+                         help="craft-memory MCP URL")
+
     # install
     p_install = sub.add_parser("install", help="Install into a Craft Agents workspace")
     p_install.add_argument("--workspace", default=None, help="Path to workspace directory")
@@ -655,6 +813,9 @@ def main():
         "ensure": cmd_ensure,
         "install": cmd_install,
         "scan": cmd_scan,
+        "analyze": cmd_analyze_code,
+        "graph": cmd_graph,
+        "watch": cmd_watch,
     }
 
     if args.command in commands:

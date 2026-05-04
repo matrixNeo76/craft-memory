@@ -1,7 +1,7 @@
 # Craft Memory System — Complete Architectural Documentation
 
 > **Date**: 2026-04-30
-> **Version**: 7.0 (Sprint 1–10 — 46 tools: observability, temporal lifecycle, boundary detection, procedural memory, scope hierarchy, graph context, batch ops, procedure intelligence, session quality, SessionDB)
+> **Version**: 8.0 (Sprint 1–10 + Phase 1–6 — 57 tools: compression, graph queries, community detection, HTML export, Cavekit workflow, code analyzer)
 > **Environment**: Windows 11, Craft Agents (pi), Python 3.12
 
 ---
