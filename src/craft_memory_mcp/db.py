@@ -20,6 +20,7 @@ from typing import Any
 
 
 logger = logging.getLogger(__name__)
+from craft_memory_mcp.compress import compress as _compress, decompress as _decompress
 
 
 def _now_iso() -> str:
@@ -316,7 +317,6 @@ def remember(
         compress_level: 0=no compression, 1=dictionary compression (~40%).
     """
     if compress_level > 0:
-        from craft_memory_mcp.compress import compress as _compress
         content = _compress(content, level=compress_level)
     c_hash = _content_hash(content + str(_now_epoch()) if force else content)
     now_iso = _now_iso()
@@ -351,7 +351,6 @@ def remember(
 def _decompress_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Decompress content of memories that were stored compressed."""
     try:
-        from craft_memory_mcp.compress import decompress as _decompress
         for r in results:
             if r.get("compressed", 0) > 0:
                 r["content"] = _decompress(r["content"])
@@ -2432,15 +2431,9 @@ def query_graph(
     params.append(min_importance)
     params.append(limit)
 
-    memories = conn.execute(
-        """SELECT * FROM memories
-            WHERE %s
-            AND importance >= ?
-            AND (lifecycle_status IS NULL OR lifecycle_status = 'active')
-            ORDER BY importance DESC
-            LIMIT ?""" % " AND ".join(where_clauses),
-        params,
-    ).fetchall()
+    query = "SELECT * FROM memories WHERE " + " AND ".join(where_clauses)
+    query += " AND importance >= ? AND (lifecycle_status IS NULL OR lifecycle_status = 'active') ORDER BY importance DESC LIMIT ?"
+    memories = conn.execute(query, params).fetchall()
 
     ids = [m["id"] for m in memories]
 

@@ -123,7 +123,13 @@ from craft_memory_mcp.db import (
     get_all_relations as _db_get_all_relations,
     export_graphml as _db_export_graphml,
     export_cypher as _db_export_cypher,
+    record_procedure_outcome as _db_record_outcome,
+    update_procedure_confidence as _db_update_conf,
 )
+
+from craft_memory_mcp.clustering import detect_communities as _cluster, get_community_stats as _cluster_stats
+from craft_memory_mcp.graph_viz import generate_graph_html as _graph_viz
+
 
 # ─── Configuration (all from env vars with sensible defaults) ────────
 
@@ -358,6 +364,22 @@ def remember(
     content = _strip_private(content)
     if not content:
         return "Memory skipped: content was empty after stripping private tags."
+
+    # Input validation
+    valid_categories = {'decision', 'discovery', 'bugfix', 'feature', 'refactor', 'change', 'note'}
+    if category not in valid_categories:
+        return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(valid_categories))}"
+    if not isinstance(importance, int) or importance < 1 or importance > 10:
+        return f"Importance must be 1-10, got {importance}"
+    if not isinstance(compress_level, int) or compress_level < 0 or compress_level > 1:
+        return f"compress_level must be 0 or 1, got {compress_level}"
+    if tags is not None:
+        if not isinstance(tags, list):
+            return "Tags must be a list of strings"
+        for t in tags:
+            if not isinstance(t, str):
+                return f"Each tag must be a string, got {type(t).__name__}"
+
     mem_id = _db_remember(
         conn, session_id, WORKSPACE_ID, content,
         category, importance, scope, session_id, tags,
@@ -1398,12 +1420,10 @@ def record_procedure_outcome_and_advance(
         return f"Procedure #{procedure_id} not found."
 
     # Registra outcome
-    from craft_memory_mcp.db import record_procedure_outcome as _db_record_outcome
     outcome_id = _db_record_outcome(conn, procedure_id, WORKSPACE_ID, outcome, notes)
     _maybe_checkpoint(conn)
 
     # Aggiorna confidence
-    from craft_memory_mcp.db import update_procedure_confidence as _db_update_conf
     new_conf = _db_update_conf(conn, procedure_id, WORKSPACE_ID)
 
     lines = [
@@ -2002,16 +2022,14 @@ def get_communities(
         Comunità rivelate con dimensione e membri principali.
     """
     conn = _get_conn()
-    from craft_memory_mcp.clustering import detect_communities, get_community_stats
-
     memories = _db_get_memories_for_graph(conn, WORKSPACE_ID, limit=limit)
     edges = _db_get_all_relations(conn, WORKSPACE_ID)
 
-    partition = detect_communities(memories, edges, resolution=resolution)
+    partition = _cluster(memories, edges, resolution=resolution)
     if not partition:
         return "Nessuna comunità rilevata. Il grafo potrebbe essere vuoto."
 
-    stats = get_community_stats(partition)
+    stats = _cluster_stats(partition)
     lines = [f"Community detection (resolution={resolution}):\n"]
     lines.append(f"  Total communities: {len(stats)}")
     lines.append(f"  Clustered nodes: {len(partition)}\n")
@@ -2052,14 +2070,11 @@ def export_graph_html(
     from pathlib import Path
 
     conn = _get_conn()
-    from craft_memory_mcp.clustering import detect_communities
-    from craft_memory_mcp.graph_viz import generate_graph_html
-
     memories = _db_get_memories_for_graph(conn, WORKSPACE_ID, limit=limit)
     edges = _db_get_all_relations(conn, WORKSPACE_ID)
-    partition = detect_communities(memories, edges, resolution=resolution)
+    partition = _cluster(memories, edges, resolution=resolution)
 
-    html = generate_graph_html(memories, edges, partition=partition, title=f"Memory Graph - {WORKSPACE_ID}")
+    html = _graph_viz(memories, edges, partition=partition, title=f"Memory Graph - {WORKSPACE_ID}")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
