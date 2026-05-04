@@ -359,6 +359,19 @@ def _decompress_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
+def _apply_source_filter(source_filter: str | None) -> tuple[str, list]:
+    """Return (SQL clause, params) for filtering by source via tags.
+
+    Args:
+        source_filter: 'automation' | 'manual' | None (no filter)
+    """
+    if source_filter == "automation":
+        return "AND tags LIKE ?", [r'%"source:automation"%']
+    elif source_filter == "manual":
+        return "AND tags LIKE ?", [r'%"source:manual"%']
+    return "", []
+
+
 def search_memory(
     conn: sqlite3.Connection,
     query: str,
@@ -367,6 +380,7 @@ def search_memory(
     limit: int = 20,
     include_inactive: bool = False,
     decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Full-text search on memories. Returns list of matching memories.
 
@@ -375,7 +389,8 @@ def search_memory(
     """
     scope_filter = "AND scope = ?" if scope else ""
     lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
-    params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    params: list[Any] = [workspace_id] + source_params
     if scope:
         params.append(scope)
 
@@ -387,6 +402,7 @@ def search_memory(
                 JOIN memories_fts fts ON m.id = fts.rowid
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
+                {source_clause}
                 {scope_filter}
                 {lifecycle_filter}
                 ORDER BY (bm25(memories_fts) * -1.0 * 0.7) + (m.importance * 0.3) DESC
@@ -403,13 +419,14 @@ def search_memory(
 
     # Fallback: LIKE search — build params independently to avoid scope binding bug
     like_pattern = f"%{query}%"
-    like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+    like_params: list[Any] = [workspace_id, like_pattern, like_pattern] + source_params
     if scope:
         like_params.append(scope)
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
             AND (content LIKE ? OR category LIKE ?)
+            {source_clause}
             {scope_filter}
             {lifecycle_filter}
             ORDER BY importance DESC, created_at_epoch DESC
@@ -448,6 +465,7 @@ def hybrid_search(
     limit: int = 20,
     k: int = 60,
     decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """RRF Hybrid Search: fuses BM25 (FTS5) + word-overlap ranking.
 
@@ -455,7 +473,8 @@ def hybrid_search(
     Falls back to LIKE search if FTS5 pool is empty.
     """
     scope_filter = "AND m.scope = ?" if scope else ""
-    base_params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    base_params: list[Any] = [workspace_id] + source_params
     if scope:
         base_params.append(scope)
 
@@ -471,6 +490,7 @@ def hybrid_search(
                 JOIN memories_fts fts ON m.id = fts.rowid
                 WHERE memories_fts MATCH ?
                 AND m.workspace_id = ?
+                {source_clause}
                 {scope_filter}
                 ORDER BY bm25(memories_fts) ASC
                 LIMIT ?""",
@@ -511,13 +531,14 @@ def hybrid_search(
     # Fallback LIKE if pool is empty
     if not results:
         like_pattern = f"%{query}%"
-        like_params: list[Any] = [workspace_id, like_pattern, like_pattern]
+        like_params: list[Any] = [workspace_id, like_pattern, like_pattern] + source_params
         if scope:
             like_params.append(scope)
         scope_like_filter = "AND scope = ?" if scope else ""
         fallback_rows = conn.execute(
             f"""SELECT * FROM memories
                 WHERE workspace_id = ? AND (content LIKE ? OR category LIKE ?)
+                {source_clause}
                 {scope_like_filter}
                 ORDER BY importance DESC, created_at_epoch DESC
                 LIMIT ?""",
@@ -538,6 +559,7 @@ def get_recent_memory(
     max_tokens: int | None = None,
     include_inactive: bool = False,
     decompress: bool = True,
+    source_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Get most relevant memories, ranked by importance with time decay.
 
@@ -546,7 +568,8 @@ def get_recent_memory(
     """
     scope_filter = "AND scope = ?" if scope else ""
     lifecycle_filter = "" if include_inactive else "AND (lifecycle_status = 'active' OR lifecycle_status IS NULL)"
-    params: list[Any] = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    params: list[Any] = [workspace_id] + source_params
     if scope:
         params.append(scope)
 
@@ -555,6 +578,7 @@ def get_recent_memory(
     rows = conn.execute(
         f"""SELECT * FROM memories
             WHERE workspace_id = ?
+            {source_clause}
             {scope_filter}
             {lifecycle_filter}
             ORDER BY created_at_epoch DESC
@@ -1485,16 +1509,18 @@ def get_memory_stats(
     conn,
     workspace_id: str,
     scope=None,
+    source_filter: str | None = None,
 ):
     """Aggregate stats for a workspace: counts, averages, edge breakdown."""
     scope_filter = "AND scope = ?" if scope else ""
-    base_params = [workspace_id]
+    source_clause, source_params = _apply_source_filter(source_filter)
+    base_params = [workspace_id] + source_params
     if scope:
         base_params.append(scope)
 
     rows = conn.execute(
         "SELECT category, COUNT(*) AS cnt FROM memories"
-        " WHERE workspace_id = ? " + scope_filter +
+        " WHERE workspace_id = ? " + source_clause + " " + scope_filter +
         " GROUP BY category",
         base_params,
     ).fetchall()
@@ -1503,13 +1529,13 @@ def get_memory_stats(
 
     core_row = conn.execute(
         "SELECT COUNT(*) FROM memories"
-        " WHERE workspace_id = ? AND is_core = 1 " + scope_filter,
+        " WHERE workspace_id = ? AND is_core = 1 " + source_clause + " " + scope_filter,
         base_params,
     ).fetchone()
     core_memories = core_row[0] if core_row else 0
 
     avg_row = conn.execute(
-        "SELECT AVG(importance) FROM memories WHERE workspace_id = ? " + scope_filter,
+        "SELECT AVG(importance) FROM memories WHERE workspace_id = ? " + source_clause + " " + scope_filter,
         base_params,
     ).fetchone()
     avg_importance = round(avg_row[0] or 0.0, 2)

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] (2026-05-04)
+
+### Features
+
+* **source_filter:** `get_recent_memory(source_filter='automation'), search_memory(source_filter='manual'), memory_stats(source_filter='automation')` — filtra memorie per origine via tags JSON (Phase 7)
+* **exposure:** tags e session_id ora visibili nei risultati di `get_recent_memory()` e `search_memory()` per tracciabilità dell'origine (Phase 7)
+* **filter:** helper SQL `_apply_source_filter()` riutilizzabile in tutte le query DB (Phase 7)
+
+### Documentation
+
+* **architecture:** v9.0 — Phase 7 source_filter documented
+
 ## [0.2.0] (2026-05-04)
 
 ### Features

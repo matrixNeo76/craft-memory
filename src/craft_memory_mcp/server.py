@@ -1133,19 +1133,22 @@ def memory_diff(
 @mcp.tool()
 def memory_stats(
     scope: str | None = None,
+    source_filter: str | None = None,
 ) -> str:
     """[admin] Aggregate stats for this workspace.
 
     Args:
         scope: Filter by scope (default: all scopes)
+        source_filter: 'automation' | 'manual' | None (default: None = all)
 
     Returns:
         Summary of workspace memory state
     """
     conn = _get_conn()
-    stats = _db_get_memory_stats(conn, WORKSPACE_ID, scope=scope)
+    stats = _db_get_memory_stats(conn, WORKSPACE_ID, scope=scope, source_filter=source_filter)
+    filter_label = f" source={source_filter}" if source_filter else ""
     lines = [
-        f"Workspace stats (scope={scope or 'all'}):",
+        f"Workspace stats (scope={scope or 'all'}{filter_label}):",
         f"  Memories: {stats['total_memories']} total ({stats['core_memories']} core, avg importance {stats['avg_importance']})",
         f"  Categories: {stats['by_category']}",
         f"  Open loops: {stats['open_loops']}",
